@@ -191,7 +191,7 @@ class BuildLabelPriorsTest(parameterized.TestCase):
         batch_shape = [4, 10]
         labels = torch.greater(torch.rand(batch_shape), 0.678).float()
 
-        label_priors_update = util.build_label_priors(labels = labels, positive_pseudocount = 0, negative_pseudocount = 0)
+        label_priors_update = util.LabelPriors(labels = labels, positive_pseudocount = 0, negative_pseudocount = 0).label_priors
         expected_priors = torch.mean(labels, dim = 0)
 
         torch.testing.assert_close(label_priors_update, expected_priors)
@@ -200,7 +200,7 @@ class BuildLabelPriorsTest(parameterized.TestCase):
         # Checks that the update of label priors behaves as expected.
         batch_shape = [1, 5]
         labels = torch.greater(torch.rand(batch_shape), 0.4).float()
-        label_priors_update = util.build_label_priors(labels)
+        label_priors_obj = util.LabelPriors(labels)
 
         label_sum = torch.ones(batch_shape)
         weight_sum = 2.0 * torch.ones(batch_shape)
@@ -209,11 +209,12 @@ class BuildLabelPriorsTest(parameterized.TestCase):
             label_sum += labels
             weight_sum += torch.ones(batch_shape)
             expected_posteriors = label_sum / weight_sum
-            label_priors = label_priors_update.reshape(batch_shape)
-            torch.testing.assert_close(label_priors, expected_posteriors)
+            label_priors_update = label_priors_obj.label_priors.reshape(batch_shape)
+            torch.testing.assert_close(label_priors_update, expected_posteriors)
 
             # Re-initialize labels to get a new random sample.
             labels = torch.greater(torch.rand(batch_shape), 0.4).float()
+            label_priors_obj.update_label_priors(labels)
 
     def testLabelPriorsUpdateWithWeights(self):
         # Checks the update of label priors with per-example weights.
@@ -223,7 +224,7 @@ class BuildLabelPriorsTest(parameterized.TestCase):
         labels = torch.greater(torch.rand(batch_shape), 0.6).float()
         weights = torch.rand(batch_shape) * 6.2
 
-        updated_priors = util.build_label_priors(labels, weights = weights)
+        updated_priors = util.LabelPriors(labels, weights = weights).label_priors
 
         expected_weighted_label_counts = 1.0 + torch.sum(weights * labels, dim = 0)
         expected_weight_sum = 2.0 + torch.sum(weights, dim = 0)

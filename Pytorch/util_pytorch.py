@@ -204,11 +204,7 @@ def expand_outer(tensor, rank):
 
     return tensor
 
-
-def build_label_priors(labels,
-                       weights = None,
-                       positive_pseudocount = 1.0,
-                       negative_pseudocount = 1.0,):
+class LabelPriors():
     """Creates an op to maintain and update label prior probabilities.
 
     For each label, the label priors are estimated as
@@ -232,24 +228,38 @@ def build_label_priors(labels,
     label_priors: An op to update the weighted label_priors. Gives the
         current value of the label priors when evaluated.
     """
-    dtype = labels.dtype
-    num_labels = get_num_labels(labels)
+    def __init__(self, labels,
+                       weights = None,
+                       positive_pseudocount = 1.0,
+                       negative_pseudocount = 1.0):
+        self.positive_pseudocount = positive_pseudocount
+        self.negative_psuedocount = negative_pseudocount
 
-    if weights is None:
-        weights = torch.ones_like(labels)
+        # Initialize weighted label counts and weight sum
+        dtype = labels.dtype
+        num_labels = get_num_labels(labels)
 
-    # Create variable and update op for weighted label counts.
-    weighted_label_counts = torch.full((num_labels,), positive_pseudocount * num_labels, dtype = dtype, requires_grad = False)
-    weighted_label_counts_update = weighted_label_counts + torch.sum(weights * labels, dim = 0)
+        if weights is None:
+            weights = torch.ones_like(labels)
 
-    # Create variable and update op for the sum of the weights.
-    weight_sum = torch.full((num_labels,), (positive_pseudocount + negative_pseudocount) * num_labels, dtype = dtype, requires_grad = False)
-    weight_sum_update = weight_sum + torch.sum(weights, dim = 0)
+        weighted_label_counts = torch.full((num_labels,), positive_pseudocount, dtype = dtype, requires_grad = False)
+        self.weighted_label_counts = weighted_label_counts + torch.sum(weights * labels, dim = 0)
+        weight_sum = torch.full((num_labels,), positive_pseudocount + negative_pseudocount, dtype = dtype, requires_grad = False)
+        self.weight_sum = weight_sum  + torch.sum(weights, dim = 0)
 
-    label_priors = torch.div(weighted_label_counts_update, weight_sum_update)
+        # Calculate Inital Priors
+        self.label_priors = torch.div(self.weighted_label_counts, self.weight_sum)
 
-    return label_priors
+    def update_label_priors(self, labels, weights = None):
 
+        if weights is None:
+            weights = torch.ones_like(labels)
+
+        self.weighted_label_counts = self.weighted_label_counts + torch.sum(weights * labels, dim = 0)
+
+        self.weight_sum = self.weight_sum + torch.sum(weights, dim = 0)
+
+        self.label_priors = torch.div(self.weighted_label_counts, self.weight_sum)
 
 def prepare_loss_args(labels, logits, positive_weights, negative_weights):
     """Prepare arguments for weighted loss functions.

@@ -34,22 +34,18 @@ class PrecisionRecallAUCLossTest(parameterized.TestCase):
     )
     def testSinglePointAUC(self, surrogate_type, target_precision):
         # Tests a case with only one anchor point, where the loss should equal
-        # recall_at_precision_loss
+        # RecallAtPrecisionLoss
         batch_shape = [10, 2]
         logits = torch.rand(batch_shape)
         labels = torch.greater(torch.rand(batch_shape), 0.4).float()
    
-        auc_loss, _ = loss_layers.precision_recall_auc_loss(
-            labels,
-            logits,
+        auc_loss, _ = loss_layers.PrecisionRecallAUCLoss(
             precision_range = (target_precision - 0.01, target_precision  + 0.01),
             num_anchors = 1,
-            surrogate_type = surrogate_type)
-        point_loss, _ = loss_layers.recall_at_precision_loss(
-            labels, 
-            logits, 
+            surrogate_type = surrogate_type).forward(labels, logits)
+        point_loss, _ = loss_layers.RecallAtPrecisionLoss(
             target_precision = target_precision,
-            surrogate_type = surrogate_type)
+            surrogate_type = surrogate_type).forward(labels, logits)
 
         torch.testing.assert_close(auc_loss, point_loss)
 
@@ -61,16 +57,16 @@ class PrecisionRecallAUCLossTest(parameterized.TestCase):
         labels = torch.greater(torch.rand(batch_shape), 0.4).float()
     
         # TODO: Place the hing/xent loss in a for loop.
-        auc_loss, _ = loss_layers.precision_recall_auc_loss(labels, logits, num_anchors = 1)
-        first_point_loss, _ = loss_layers.recall_at_precision_loss(labels, logits, target_precision = 0.25)
-        second_point_loss, _ = loss_layers.recall_at_precision_loss(labels, logits, target_precision = 0.5)
-        third_point_loss, _ = loss_layers.recall_at_precision_loss(labels, logits, target_precision = 0.75)
+        auc_loss, _ = loss_layers.PrecisionRecallAUCLoss(num_anchors = 1).forward(labels, logits)
+        first_point_loss, _ = loss_layers.RecallAtPrecisionLoss(target_precision = 0.25).forward(labels, logits)
+        second_point_loss, _ = loss_layers.RecallAtPrecisionLoss(target_precision = 0.5).forward(labels, logits)
+        third_point_loss, _ = loss_layers.RecallAtPrecisionLoss(target_precision = 0.75).forward(labels, logits)
         expected_loss = (first_point_loss + second_point_loss + third_point_loss) / 3
 
-        auc_loss_hinge, _ = loss_layers.precision_recall_auc_loss(labels, logits, num_anchors = 1, surrogate_type = 'hinge')
-        first_point_hinge, _ = loss_layers.recall_at_precision_loss(labels, logits, target_precision = 0.25, surrogate_type = 'hinge')
-        second_point_hinge, _ = loss_layers.recall_at_precision_loss(labels, logits, target_precision = 0.5, surrogate_type = 'hinge')
-        third_point_hinge, _ = loss_layers.recall_at_precision_loss(labels, logits, target_precision = 0.75, surrogate_type = 'hinge')
+        auc_loss_hinge, _ = loss_layers.PrecisionRecallAUCLoss(num_anchors = 1, surrogate_type = 'hinge').forward(labels, logits)
+        first_point_hinge, _ = loss_layers.RecallAtPrecisionLoss(target_precision = 0.25, surrogate_type = 'hinge').forward(labels, logits)
+        second_point_hinge, _ = loss_layers.RecallAtPrecisionLoss(target_precision = 0.5, surrogate_type = 'hinge').forward(labels, logits)
+        third_point_hinge, _ = loss_layers.RecallAtPrecisionLoss(target_precision = 0.75, surrogate_type = 'hinge').forward(labels, logits)
         expected_hinge = (first_point_hinge + second_point_hinge + third_point_hinge) / 3
 
         torch.testing.assert_close(auc_loss, expected_loss)
@@ -86,16 +82,14 @@ class PrecisionRecallAUCLossTest(parameterized.TestCase):
                             'surrogate_type': surrogate_type}
 
                 run_lagrange_multiplier_test(
-                    global_objective = loss_layers.precision_recall_auc_loss,
+                    global_objective = loss_layers.PrecisionRecallAUCLoss,
                     objective_kwargs = kwargs,
-                    data_builder = _multilabel_data,
-                    test_object = self)
+                    data_builder = _multilabel_data)
 
                 run_lagrange_multiplier_test(
-                    global_objective = loss_layers.precision_recall_auc_loss,
+                    global_objective = loss_layers.PrecisionRecallAUCLoss,
                     objective_kwargs = kwargs,
-                    data_builder = _other_multilabel_data(surrogate_type),
-                    test_object = self)
+                    data_builder = _other_multilabel_data(surrogate_type))
 
 
 class ROCAUCLossTest(parameterized.TestCase):
@@ -109,17 +103,17 @@ class ROCAUCLossTest(parameterized.TestCase):
         labels = torch.tensor([0.0] + [1.0] * num_positives).reshape(num_positives + 1, 1)
         scores = torch.cat([torch.tensor([0.0]), scores_positives], 0)
 
-        loss = torch.sum(loss_layers.roc_auc_loss(labels, scores, surrogate_type = 'hinge')[0])
+        loss = torch.sum(loss_layers.ROCAUCLoss(surrogate_type = 'hinge').forward(labels, scores)[0])
         expected_loss = torch.sum(torch.maximum(1.0 - scores_positives, torch.tensor([0]))) / (num_positives + 1)
     
-        #torch.testing.assert_close(expected_loss, loss)
+        torch.testing.assert_close(expected_loss, loss)
 
     def testRandomROCLoss(self):
         # Checks that random Bernoulli scores and labels has ~25% swaps.
         shape = [1000, 30]
         scores = torch.as_tensor(np.random.randint(0, 2, size = shape), dtype = torch.float32)
         labels = torch.as_tensor(np.random.randint(0, 2, size = shape), dtype = torch.float32)
-        loss = torch.mean(loss_layers.roc_auc_loss(labels, scores, surrogate_type = 'hinge')[0])
+        loss = torch.mean(loss_layers.ROCAUCLoss(surrogate_type = 'hinge').forward(labels, scores)[0])
     
         torch.testing.assert_close(torch.tensor(0.25), loss, rtol = 1e-2, atol = 1e-2)
 
@@ -144,7 +138,7 @@ class ROCAUCLossTest(parameterized.TestCase):
     def testManualROCLoss(self, surrogate_type, labels, logits, expected_value):
         labels = torch.as_tensor(labels)
         logits = torch.as_tensor(logits)
-        loss, _ = loss_layers.roc_auc_loss(labels = labels, logits = logits, surrogate_type = surrogate_type)
+        loss, _ = loss_layers.ROCAUCLoss(surrogate_type = surrogate_type).forward(labels = labels, logits = logits)
 
         torch.testing.assert_close(torch.tensor(expected_value), torch.sum(loss), check_dtype = False)
 
@@ -152,9 +146,9 @@ class ROCAUCLossTest(parameterized.TestCase):
         # Tests the loss on multi-label data against manually computed loss.
         targets = np.array([[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]])
         scores = np.array([[0.1, 1.0, 1.1, 1.0], [1.0, 0.0, 1.3, 1.1]])
-        class_1_auc = torch.sum(loss_layers.roc_auc_loss(targets[0], scores[0])[0])
-        class_2_auc = torch.sum(loss_layers.roc_auc_loss(targets[1], scores[1])[0])
-        total_auc = torch.sum(loss_layers.roc_auc_loss(targets.transpose(), scores.transpose())[0])
+        class_1_auc = torch.sum(loss_layers.ROCAUCLoss().forward(targets[0], scores[0])[0])
+        class_2_auc = torch.sum(loss_layers.ROCAUCLoss().forward(targets[1], scores[1])[0])
+        total_auc = torch.sum(loss_layers.ROCAUCLoss().forward(targets.transpose(), scores.transpose())[0])
 
         torch.testing.assert_close(total_auc, class_1_auc + class_2_auc)
 
@@ -168,8 +162,8 @@ class ROCAUCLossTest(parameterized.TestCase):
         targets = torch.tensor([1, 1, 1, 0, 0, 0, 0, 0, 0], dtype = torch.float32).reshape(9, 1)
         weights = torch.tensor([1, 1, 1, 0, 0, 0, 2, 2, 2], dtype = torch.float32).reshape(9, 1)
 
-        loss = torch.sum(loss_layers.roc_auc_loss(targets, logits)[0])
-        weighted_loss = torch.sum(loss_layers.roc_auc_loss(targets, logits, weights)[0])
+        loss = torch.sum(loss_layers.ROCAUCLoss().forward(targets, logits)[0])
+        weighted_loss = torch.sum(loss_layers.ROCAUCLoss(weights = weights).forward(targets, logits)[0])
 
         torch.testing.assert_close(loss, weighted_loss)
 
@@ -185,7 +179,7 @@ class RecallAtPrecisionTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(batch_shape), 0.7).float()
         label_priors = torch.full((num_labels,), 0.34)
 
-        loss, _ = loss_layers.recall_at_precision_loss(targets, logits, target_precision, label_priors = label_priors)
+        loss, _ = loss_layers.RecallAtPrecisionLoss(target_precision, label_priors = label_priors).forward(targets, logits)
         expected_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction = 'none')
 
         torch.testing.assert_close(loss, expected_loss)
@@ -200,13 +194,11 @@ class RecallAtPrecisionTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(target_shape), 0.7).float()
         label_priors = torch.full((num_labels,), 0.34)
 
-        loss, _ = loss_layers.recall_at_precision_loss(
-            targets,
-            logits,
+        loss, _ = loss_layers.RecallAtPrecisionLoss(
             target_precision,
             label_priors = label_priors,
             surrogate_type = 'xent',
-        )
+        ).forward(targets, logits)
 
         expected_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction = 'none')
 
@@ -222,9 +214,9 @@ class RecallAtPrecisionTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(batch_shape), 0.4).float()
         label_priors = torch.full((num_labels,), 0.45)
 
-        loss, _ = loss_layers.recall_at_precision_loss(
-            targets, logits, target_precision, label_priors = label_priors,
-            lambdas_initializer = torch.nn.init.zeros_)
+        loss, _ = loss_layers.RecallAtPrecisionLoss(
+            target_precision, label_priors = label_priors,
+            lambdas_initializer = torch.nn.init.zeros_).forward(targets, logits)
         expected_loss = util.weighted_sigmoid_cross_entropy_with_logits(
             targets,
             logits,
@@ -247,16 +239,16 @@ class RecallAtPrecisionTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(batch_shape), 0.4).float()
         label_priors = torch.tensor([0.45, 0.8, 0.3])
 
-        multi_label_loss, _ = loss_layers.recall_at_precision_loss(
-            targets, logits, target_precision, label_priors = label_priors,
-        )
+        multi_label_loss, _ = loss_layers.RecallAtPrecisionLoss(
+            target_precision, label_priors = label_priors,
+        ).forward(targets, logits)
 
         single_label_losses = [
-            loss_layers.recall_at_precision_loss(
-                torch.unsqueeze(targets[:, i], -1),
-                torch.unsqueeze(logits[:, i], -1),
+            loss_layers.RecallAtPrecisionLoss(
                 target_precision[i],
-                label_priors = label_priors[i])[0]
+                label_priors = label_priors[i]).forward(
+                torch.unsqueeze(targets[:, i], -1),
+                torch.unsqueeze(logits[:, i], -1))[0]
             for i in range(num_labels)
         ]
 
@@ -276,21 +268,17 @@ class RecallAtPrecisionTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(target_shape), 0.7).float()
         label_priors = torch.full((num_labels,), 0.34)
 
-        multi_precision_loss, _ = loss_layers.recall_at_precision_loss(
-            targets,
-            logits,
+        multi_precision_loss, _ = loss_layers.RecallAtPrecisionLoss(
             [0.75, 0.75],
             label_priors = label_priors,
             surrogate_type = 'xent',
-        )
+        ).forward(targets, logits)
 
-        single_precision_loss, _ = loss_layers.recall_at_precision_loss(
-            targets,
-            logits,
+        single_precision_loss, _ = loss_layers.RecallAtPrecisionLoss(
             0.75,
             label_priors = label_priors,
             surrogate_type = 'xent',
-        )
+        ).forward(targets, logits)
 
         torch.testing.assert_close(multi_precision_loss, single_precision_loss)
 
@@ -301,16 +289,14 @@ class RecallAtPrecisionTest(parameterized.TestCase):
                             'surrogate_type': surrogate_type}
 
                 run_lagrange_multiplier_test(
-                    global_objective = loss_layers.recall_at_precision_loss,
+                    global_objective = loss_layers.RecallAtPrecisionLoss,
                     objective_kwargs = kwargs,
-                    data_builder = _multilabel_data,
-                    test_object = self)
+                    data_builder = _multilabel_data)
 
                 run_lagrange_multiplier_test(
-                    global_objective = loss_layers.recall_at_precision_loss,
+                    global_objective = loss_layers.RecallAtPrecisionLoss,
                     objective_kwargs = kwargs,
-                    data_builder = _other_multilabel_data(surrogate_type),
-                    test_object = self)
+                    data_builder = _other_multilabel_data(surrogate_type))
 
     def testLagrangeMultiplierUpdateDirectionWithMultiplePrecisions(self):
         """Runs Lagrange multiplier test with multiple precision values."""
@@ -323,16 +309,14 @@ class RecallAtPrecisionTest(parameterized.TestCase):
             }
 
             run_lagrange_multiplier_test(
-                global_objective = loss_layers.recall_at_precision_loss,
+                global_objective = loss_layers.RecallAtPrecisionLoss,
                 objective_kwargs = kwargs,
-                data_builder = _multilabel_data,
-                test_object = self)
+                data_builder = _multilabel_data)
 
             run_lagrange_multiplier_test(
-                global_objective = loss_layers.recall_at_precision_loss,
+                global_objective = loss_layers.RecallAtPrecisionLoss,
                 objective_kwargs = kwargs,
-                data_builder = _other_multilabel_data(surrogate_type),
-                test_object = self)
+                data_builder = _other_multilabel_data(surrogate_type))
 
 
 class PrecisionAtRecallTest(parameterized.TestCase):
@@ -345,9 +329,9 @@ class PrecisionAtRecallTest(parameterized.TestCase):
         logits = torch.rand(batch_shape)
         targets = torch.greater(torch.rand(batch_shape), 0.4).float()
 
-        loss, _ = loss_layers.precision_at_recall_loss(
-            targets, logits, target_recall,
-            lambdas_initializer = torch.nn.init.ones_)
+        loss, _ = loss_layers.PrecisionAtRecallLoss(
+            target_recall,
+            lambdas_initializer = torch.nn.init.ones_).forward(targets, logits)
         expected_loss = util.weighted_sigmoid_cross_entropy_with_logits(
             targets, logits)
     
@@ -362,12 +346,10 @@ class PrecisionAtRecallTest(parameterized.TestCase):
         logits = torch.rand(batch_shape)
         targets = torch.greater(torch.rand(batch_shape), 0.6).float()
 
-        loss, _ = loss_layers.precision_at_recall_loss(
-            targets,
-            logits,
+        loss, _ = loss_layers.PrecisionAtRecallLoss(
             target_recall,
             surrogate_type = 'hinge',
-            lambdas_initializer = torch.nn.init.zeros_)
+            lambdas_initializer = torch.nn.init.zeros_).forward(targets, logits)
         expected_loss = util.weighted_hinge_loss(
             targets, logits, positive_weights = 0.0, negative_weights = 1.0)
 
@@ -381,16 +363,14 @@ class PrecisionAtRecallTest(parameterized.TestCase):
                             'surrogate_type': surrogate_type}
 
                 run_lagrange_multiplier_test(
-                    global_objective = loss_layers.precision_at_recall_loss,
+                    global_objective = loss_layers.PrecisionAtRecallLoss,
                     objective_kwargs = kwargs,
-                    data_builder = _multilabel_data,
-                    test_object = self)
+                    data_builder = _multilabel_data)
 
                 run_lagrange_multiplier_test(
-                    global_objective = loss_layers.precision_at_recall_loss,
+                    global_objective = loss_layers.PrecisionAtRecallLoss,
                     objective_kwargs = kwargs,
-                    data_builder = _other_multilabel_data(surrogate_type),
-                    test_object = self)
+                    data_builder = _other_multilabel_data(surrogate_type))
 
     def testCrossEntropyEquivalenceWithMultipleRecalls(self):
         """Checks a case where the loss equals xent loss with multiple recalls."""
@@ -400,9 +380,9 @@ class PrecisionAtRecallTest(parameterized.TestCase):
         logits = torch.rand(batch_shape)
         targets = torch.greater(torch.rand(batch_shape), 0.4).float()
 
-        loss, _ = loss_layers.precision_at_recall_loss(
-            targets, logits, target_recall,
-            lambdas_initializer = torch.nn.init.ones_)
+        loss, _ = loss_layers.PrecisionAtRecallLoss(
+            target_recall,
+            lambdas_initializer = torch.nn.init.ones_).forward(targets, logits)
         expected_loss = util.weighted_sigmoid_cross_entropy_with_logits(
             targets, logits)
 
@@ -419,12 +399,10 @@ class PrecisionAtRecallTest(parameterized.TestCase):
         logits = torch.rand(batch_shape)
         targets = torch.greater(torch.rand(batch_shape), 0.6).float()
 
-        loss, _ = loss_layers.precision_at_recall_loss(
-            targets,
-            logits,
+        loss, _ = loss_layers.PrecisionAtRecallLoss(
             target_recall,
             surrogate_type = 'hinge',
-            lambdas_initializer = torch.nn.init.zeros_)
+            lambdas_initializer = torch.nn.init.zeros_).forward(targets, logits)
         expected_loss = util.weighted_hinge_loss(
             targets, logits, positive_weights = 0.0, negative_weights = 1.0)
 
@@ -440,16 +418,14 @@ class PrecisionAtRecallTest(parameterized.TestCase):
                     'surrogate_type': surrogate_type}
 
             run_lagrange_multiplier_test(
-                global_objective = loss_layers.precision_at_recall_loss,
+                global_objective = loss_layers.PrecisionAtRecallLoss,
                 objective_kwargs = kwargs,
-                data_builder = _multilabel_data,
-                test_object = self)
+                data_builder = _multilabel_data)
 
             run_lagrange_multiplier_test(
-                global_objective = loss_layers.precision_at_recall_loss,
+                global_objective = loss_layers.PrecisionAtRecallLoss,
                 objective_kwargs = kwargs,
-                data_builder = _other_multilabel_data(surrogate_type),
-                test_object = self)
+                data_builder = _other_multilabel_data(surrogate_type))
 
     def testEquivalenceBetweenSingleAndMultipleRecalls(self):
         """Checks precision at recall with multiple different recall values.
@@ -465,16 +441,16 @@ class PrecisionAtRecallTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(batch_shape), 0.4).float()
         label_priors = torch.full((num_labels,), 0.45)
 
-        multi_label_loss, _ = loss_layers.precision_at_recall_loss(
-            targets, logits, target_precision, label_priors = label_priors
-        )
+        multi_label_loss, _ = loss_layers.PrecisionAtRecallLoss(
+            target_precision, label_priors = label_priors
+        ).forward(targets, logits)
 
         single_label_losses = [
-            loss_layers.precision_at_recall_loss(
-                torch.unsqueeze(targets[:, i], -1),
-                torch.unsqueeze(logits[:, i], -1),
+            loss_layers.PrecisionAtRecallLoss(
                 target_precision[i],
-                label_priors = label_priors[i])[0]
+                label_priors = label_priors[i]).forward(
+                torch.unsqueeze(targets[:, i], -1),
+                torch.unsqueeze(logits[:, i], -1))[0]
             for i in range(num_labels)
         ]
 
@@ -494,21 +470,17 @@ class PrecisionAtRecallTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(target_shape), 0.7).float()
         label_priors = torch.full((num_labels,), 0.34)
 
-        multi_precision_loss, _ = loss_layers.precision_at_recall_loss(
-            targets,
-            logits,
+        multi_precision_loss, _ = loss_layers.PrecisionAtRecallLoss(
             [0.75, 0.75],
             label_priors = label_priors,
             surrogate_type = 'xent',
-        )
+        ).forward(targets, logits)
 
-        single_precision_loss, _ = loss_layers.precision_at_recall_loss(
-            targets,
-            logits,
+        single_precision_loss, _ = loss_layers.PrecisionAtRecallLoss(
             0.75,
             label_priors = label_priors,
             surrogate_type = 'xent',
-        )
+        ).forward(targets, logits)
 
         torch.testing.assert_close(multi_precision_loss, single_precision_loss)
 
@@ -525,18 +497,18 @@ class FalsePositiveRateAtTruePositiveRateTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(batch_shape), 0.4).float()
         label_priors = torch.as_tensor(np.random.uniform(size = [num_labels]), dtype = torch.float32)
 
-        xent_loss, _ = loss_layers.false_positive_rate_at_true_positive_rate_loss(
-            targets, logits, target_recall, label_priors = label_priors,
-            lambdas_initializer = torch.nn.init.zeros_)
+        xent_loss, _ = loss_layers.FalsePositveRateAtTruePositiveRateLoss(
+            target_recall, label_priors = label_priors,
+            lambdas_initializer = torch.nn.init.zeros_).forward(targets, logits)
         xent_expected = util.weighted_sigmoid_cross_entropy_with_logits(
             targets,
             logits,
             positive_weights = 0.0,
             negative_weights = 1.0)
-        hinge_loss, _ = loss_layers.false_positive_rate_at_true_positive_rate_loss(
-            targets, logits, target_recall, label_priors = label_priors,
+        hinge_loss, _ = loss_layers.FalsePositveRateAtTruePositiveRateLoss(
+            target_recall, label_priors = label_priors,
             lambdas_initializer = torch.nn.init.zeros_,
-            surrogate_type = 'hinge')
+            surrogate_type = 'hinge').forward(targets, logits)
         hinge_expected = util.weighted_hinge_loss(
             targets,
             logits,
@@ -556,13 +528,13 @@ class FalsePositiveRateAtTruePositiveRateTest(parameterized.TestCase):
         targets = torch.ones_like(logits)
         label_priors = torch.as_tensor(np.random.uniform(size = [num_labels]), dtype = torch.float32)
 
-        loss, _ = loss_layers.false_positive_rate_at_true_positive_rate_loss(
-            targets, logits, target_recall, label_priors = label_priors)
+        loss, _ = loss_layers.FalsePositveRateAtTruePositiveRateLoss(
+            target_recall, label_priors = label_priors).forward(targets, logits)
         expected_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             logits, targets, reduction = 'none')
-        hinge_loss, _ = loss_layers.false_positive_rate_at_true_positive_rate_loss(
-            targets, logits, target_recall, label_priors = label_priors,
-            surrogate_type = 'hinge')
+        hinge_loss, _ = loss_layers.FalsePositveRateAtTruePositiveRateLoss(
+            target_recall, label_priors = label_priors,
+            surrogate_type = 'hinge').forward(targets, logits)
         expected_hinge = util.weighted_hinge_loss(
             targets, logits)
   
@@ -579,8 +551,8 @@ class FalsePositiveRateAtTruePositiveRateTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(batch_shape), 0.6).float()
         label_priors = torch.full((num_labels,), 0.5)
 
-        loss, _ = loss_layers.false_positive_rate_at_true_positive_rate_loss(
-            targets, logits, target_recall, label_priors = label_priors)
+        loss, _ = loss_layers.FalsePositveRateAtTruePositiveRateLoss(
+            target_recall, label_priors = label_priors).forward(targets, logits)
         expected_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             logits, targets, reduction = 'none')
 
@@ -595,16 +567,14 @@ class FalsePositiveRateAtTruePositiveRateTest(parameterized.TestCase):
                 # True positive rate is a synonym for recall, so we use the
                 # recall constraint data.
                 run_lagrange_multiplier_test(
-                    global_objective = (loss_layers.false_positive_rate_at_true_positive_rate_loss),
+                    global_objective = (loss_layers.FalsePositveRateAtTruePositiveRateLoss),
                     objective_kwargs = kwargs,
-                    data_builder = _multilabel_data,
-                    test_object = self)
+                    data_builder = _multilabel_data)
 
                 run_lagrange_multiplier_test(
-                    global_objective = (loss_layers.false_positive_rate_at_true_positive_rate_loss),
+                    global_objective = (loss_layers.FalsePositveRateAtTruePositiveRateLoss),
                     objective_kwargs = kwargs,
-                    data_builder = _other_multilabel_data(surrogate_type),
-                    test_object = self)
+                    data_builder = _other_multilabel_data(surrogate_type))
 
     def testLagrangeMultiplierUpdateDirectionWithMultipleRates(self):
         """Runs Lagrange multiplier test with multiple target rates."""
@@ -617,16 +587,14 @@ class FalsePositiveRateAtTruePositiveRateTest(parameterized.TestCase):
             # True positive rate is a synonym for recall, so we use the
             # recall constraint data.
             run_lagrange_multiplier_test(
-                global_objective = loss_layers.false_positive_rate_at_true_positive_rate_loss,
+                global_objective = loss_layers.FalsePositveRateAtTruePositiveRateLoss,
                 objective_kwargs = kwargs,
-                data_builder = _multilabel_data,
-                test_object = self)
+                data_builder = _multilabel_data)
 
             run_lagrange_multiplier_test(
-                global_objective = loss_layers.false_positive_rate_at_true_positive_rate_loss,
+                global_objective = loss_layers.FalsePositveRateAtTruePositiveRateLoss,
                 objective_kwargs = kwargs,
-                data_builder = _other_multilabel_data(surrogate_type),
-                test_object = self)
+                data_builder = _other_multilabel_data(surrogate_type))
 
     def testEquivalenceBetweenSingleAndEqualMultipleRates(self):
         """Compares single and multiple target rates of the same value.
@@ -641,19 +609,19 @@ class FalsePositiveRateAtTruePositiveRateTest(parameterized.TestCase):
         label_priors = torch.full((num_labels,), 0.34)
 
         multi_label_loss, _ = (
-            loss_layers.false_positive_rate_at_true_positive_rate_loss(
-                targets, logits, [0.75, 0.75], label_priors = label_priors))
+            loss_layers.FalsePositveRateAtTruePositiveRateLoss(
+                [0.75, 0.75], label_priors = label_priors).forward(targets, logits))
 
         single_label_loss, _ = (
-            loss_layers.false_positive_rate_at_true_positive_rate_loss(
-                targets, logits, 0.75, label_priors = label_priors))
+            loss_layers.FalsePositveRateAtTruePositiveRateLoss(
+                0.75, label_priors = label_priors).forward(targets, logits))
 
         torch.testing.assert_close(multi_label_loss, single_label_loss)
 
     def testEquivalenceBetweenSingleAndMultipleRates(self):
         """Compares single and multiple target rates of different values.
 
-        Runs false_positive_rate_at_true_positive_rate_loss with multiple target
+        Runs FalsePositveRateAtTruePositiveRateLoss with multiple target
         rates, and runs each label seperately with its own target rate as a
         scalar. Validates that the returned loss values are the same.
         """
@@ -665,15 +633,15 @@ class FalsePositiveRateAtTruePositiveRateTest(parameterized.TestCase):
         label_priors = torch.full((num_labels,), 0.45)
 
         multi_label_loss, _ = (
-            loss_layers.false_positive_rate_at_true_positive_rate_loss(
-                targets, logits, target_precision, label_priors = label_priors))
+            loss_layers.FalsePositveRateAtTruePositiveRateLoss(
+                target_precision, label_priors = label_priors).forward(targets, logits))
 
         single_label_losses = [
-            loss_layers.false_positive_rate_at_true_positive_rate_loss(
-                torch.unsqueeze(targets[:, i], -1),
-                torch.unsqueeze(logits[:, i], -1),
+            loss_layers.FalsePositveRateAtTruePositiveRateLoss(
                 target_precision[i],
-                label_priors = label_priors[i])[0]
+                label_priors = label_priors[i]).forward(
+                torch.unsqueeze(targets[:, i], -1),
+                torch.unsqueeze(logits[:, i], -1))[0]
             for i in range(num_labels)
         ]
 
@@ -694,18 +662,18 @@ class TruePositiveRateAtFalsePositiveRateTest(parameterized.TestCase):
         targets = torch.greater(torch.rand(batch_shape), 0.6).float()
         label_priors = torch.as_tensor(np.random.uniform(size = [num_labels]), dtype = torch.float32)
 
-        xent_loss, _ = loss_layers.true_positive_rate_at_false_positive_rate_loss(
-            targets, logits, target_rate, label_priors = label_priors,
-            lambdas_initializer = torch.nn.init.zeros_)
+        xent_loss, _ = loss_layers.TruePositiveRateAtFalsePositiveRateLoss(
+            target_rate, label_priors = label_priors,
+            lambdas_initializer = torch.nn.init.zeros_).forward(targets, logits)
         xent_expected = util.weighted_sigmoid_cross_entropy_with_logits(
             targets,
             logits,
             positive_weights = 1.0,
             negative_weights = 0.0)
-        hinge_loss, _ = loss_layers.true_positive_rate_at_false_positive_rate_loss(
-            targets, logits, target_rate, label_priors = label_priors,
+        hinge_loss, _ = loss_layers.TruePositiveRateAtFalsePositiveRateLoss(
+            target_rate, label_priors = label_priors,
             lambdas_initializer = torch.nn.init.zeros_,
-            surrogate_type = 'hinge')
+            surrogate_type = 'hinge').forward(targets, logits)
         hinge_expected = util.weighted_hinge_loss(
             targets,
             logits,
@@ -725,14 +693,14 @@ class TruePositiveRateAtFalsePositiveRateTest(parameterized.TestCase):
         targets = torch.zeros_like(logits)
         label_priors = torch.as_tensor(np.random.uniform(size = [num_labels]),dtype = torch.float32)
 
-        xent_loss, _ = loss_layers.true_positive_rate_at_false_positive_rate_loss(
-            targets, logits, target_rate, label_priors = label_priors)
+        xent_loss, _ = loss_layers.TruePositiveRateAtFalsePositiveRateLoss(
+            target_rate, label_priors = label_priors).forward(targets, logits)
         xent_expected = torch.subtract(
             util.weighted_sigmoid_cross_entropy_with_logits(targets, logits, positive_weights = 0.0, negative_weights = 1.0),
             target_rate * (1.0 - label_priors) * np.log(2))
-        hinge_loss, _ = loss_layers.true_positive_rate_at_false_positive_rate_loss(
-            targets, logits, target_rate, label_priors = label_priors,
-            surrogate_type = 'hinge')
+        hinge_loss, _ = loss_layers.TruePositiveRateAtFalsePositiveRateLoss(
+            target_rate, label_priors = label_priors,
+            surrogate_type = 'hinge').forward(targets, logits)
         hinge_expected = util.weighted_hinge_loss(
             targets, logits) - target_rate * (1.0 - label_priors)
 
@@ -746,16 +714,14 @@ class TruePositiveRateAtFalsePositiveRateTest(parameterized.TestCase):
                             'surrogate_type': surrogate_type}
 
                 run_lagrange_multiplier_test(
-                    global_objective = loss_layers.true_positive_rate_at_false_positive_rate_loss,
+                    global_objective = loss_layers.TruePositiveRateAtFalsePositiveRateLoss,
                     objective_kwargs = kwargs,
-                    data_builder = _multilabel_data,
-                    test_object = self)
+                    data_builder = _multilabel_data)
 
                 run_lagrange_multiplier_test(
-                    global_objective = loss_layers.true_positive_rate_at_false_positive_rate_loss,
+                    global_objective = loss_layers.TruePositiveRateAtFalsePositiveRateLoss,
                     objective_kwargs = kwargs,
-                    data_builder = _other_multilabel_data(surrogate_type),
-                    test_object = self)
+                    data_builder = _other_multilabel_data(surrogate_type))
 
     def testLagrangeMultiplierUpdateDirectionWithMultipleRates(self):
         """Runs Lagrange multiplier test with multiple target rates."""
@@ -766,16 +732,14 @@ class TruePositiveRateAtFalsePositiveRateTest(parameterized.TestCase):
                     'surrogate_type': surrogate_type}
 
             run_lagrange_multiplier_test(
-                global_objective = loss_layers.true_positive_rate_at_false_positive_rate_loss,
+                global_objective = loss_layers.TruePositiveRateAtFalsePositiveRateLoss,
                 objective_kwargs = kwargs,
-                data_builder = _multilabel_data,
-                test_object = self)
+                data_builder = _multilabel_data)
 
             run_lagrange_multiplier_test(
-                global_objective = loss_layers.true_positive_rate_at_false_positive_rate_loss,
+                global_objective = loss_layers.TruePositiveRateAtFalsePositiveRateLoss,
                 objective_kwargs = kwargs,
-                data_builder = _other_multilabel_data(surrogate_type),
-                test_object = self)
+                data_builder = _other_multilabel_data(surrogate_type))
 
     def testEquivalenceBetweenSingleAndEqualMultipleRates(self):
         """Compares single and multiple target rates of the same value.
@@ -790,19 +754,19 @@ class TruePositiveRateAtFalsePositiveRateTest(parameterized.TestCase):
         label_priors = torch.full((num_labels,), 0.34)
 
         multi_label_loss, _ = (
-            loss_layers.true_positive_rate_at_false_positive_rate_loss(
-                targets, logits, [0.75, 0.75], label_priors = label_priors))
+            loss_layers.TruePositiveRateAtFalsePositiveRateLoss(
+                [0.75, 0.75], label_priors = label_priors)).forward(targets, logits)
 
         single_label_loss, _ = (
-            loss_layers.true_positive_rate_at_false_positive_rate_loss(
-                targets, logits, 0.75, label_priors = label_priors))
+            loss_layers.TruePositiveRateAtFalsePositiveRateLoss(
+                0.75, label_priors = label_priors)).forward(targets, logits)
 
         torch.testing.assert_close(multi_label_loss, single_label_loss)
 
     def testEquivalenceBetweenSingleAndMultipleRates(self):
         """Compares single and multiple target rates of different values.
 
-        Runs true_positive_rate_at_false_positive_rate_loss with multiple target
+        Runs TruePositiveRateAtFalsePositiveRateLoss with multiple target
         rates, and runs each label seperately with its own target rate as a
         scalar. Validates that the returned loss values are the same.
         """
@@ -814,15 +778,15 @@ class TruePositiveRateAtFalsePositiveRateTest(parameterized.TestCase):
         label_priors = torch.full((num_labels,), 0.45)
 
         multi_label_loss, _ = (
-            loss_layers.true_positive_rate_at_false_positive_rate_loss(
-                targets, logits, target_precision, label_priors = label_priors))
+            loss_layers.TruePositiveRateAtFalsePositiveRateLoss(
+                target_precision, label_priors = label_priors).forward(targets, logits))
 
         single_label_losses = [
-            loss_layers.true_positive_rate_at_false_positive_rate_loss(
-                torch.unsqueeze(targets[:, i], -1),
-                torch.unsqueeze(logits[:, i], -1),
+            loss_layers.TruePositiveRateAtFalsePositiveRateLoss(
                 target_precision[i],
-                label_priors = label_priors[i])[0]
+                label_priors = label_priors[i]).forward(
+                torch.unsqueeze(targets[:, i], -1),
+                torch.unsqueeze(logits[:, i], -1))[0]
             for i in range(num_labels)
         ]
 
@@ -836,9 +800,10 @@ class UtilityFunctionsTest(parameterized.TestCase):
     def testTrainableDualVariable(self):
         # Confirm correct behavior of a trainable dual variable.
         x = torch.tensor([2.0], dtype = torch.float32, requires_grad = True) # primal
-        y_value, y = loss_layers._create_dual_variable(
+        lambda_obj = loss_layers.DualVariable(
             shape = (1,), dtype = torch.float32, initializer = torch.nn.init.ones_,
             trainable = True, dual_rate_factor = 0.3)
+        y_value = lambda_obj.dual_variable
         optimizer = torch.optim.SGD([x, y_value], lr = 1.0)
         # Update parameters once(?)
         loss = 0.5 * torch.square(x - y_value);
@@ -846,14 +811,15 @@ class UtilityFunctionsTest(parameterized.TestCase):
         loss.backward()
         optimizer.step()
 
-        torch.testing.assert_close(torch.tensor([0.7]), y)
+        torch.testing.assert_close(torch.tensor([0.7]), lambda_obj.get_dual_variable())
 
     def testUntrainableDualVariable(self):
         # Confirm correct behavior of dual variable which is not trainable.
         x = torch.tensor([-2.0], dtype = torch.float32, requires_grad = True) # primal
-        y_value, y = loss_layers._create_dual_variable(
+        lambda_obj = loss_layers.DualVariable(
             shape = (1,), dtype = torch.float32, initializer = torch.nn.init.ones_,
             trainable = False, dual_rate_factor = 0.8)
+        y_value = lambda_obj.dual_variable
         optimizer = torch.optim.SGD([x, y_value], lr = 1.0)
         # Update parameters once(?)
         loss = torch.square(x) * y_value + torch.exp(y_value)
@@ -861,7 +827,7 @@ class UtilityFunctionsTest(parameterized.TestCase):
         loss.backward()
         optimizer.step()
 
-        torch.testing.assert_close(torch.tensor([1.0]), y)
+        torch.testing.assert_close(torch.tensor([1.0]), lambda_obj.get_dual_variable())
 
 
 class BoundTest(parameterized.TestCase):
@@ -939,9 +905,8 @@ class BoundTest(parameterized.TestCase):
 
 
 def run_lagrange_multiplier_test(global_objective,
-                                    objective_kwargs,
-                                    data_builder,
-                                    test_object):
+                                 objective_kwargs,
+                                 data_builder):
     """Runs a test for the Lagrange multiplier update of `global_objective`.
 
     The test checks that the constraint for `global_objective` is satisfied on
@@ -954,16 +919,13 @@ def run_lagrange_multiplier_test(global_objective,
         of `global_objective`, e.g. 'target_rate' or 'target_precision'.
     data_builder: A function  which returns tensors corresponding to labels,
         logits, and label priors.
-    test_object: An instance of .
     """
     # Construct global objective kwargs from a copy of `objective_kwargs`.
     kwargs = dict(objective_kwargs)
     targets, logits, priors = data_builder()
-    kwargs['labels'] = targets
-    kwargs['logits'] = logits
     kwargs['label_priors'] = priors
 
-    loss, output_dict = global_objective(**kwargs)
+    loss, output_dict = global_objective(**kwargs).forward(targets, logits)
     lambdas = torch.squeeze(output_dict['lambdas'])
     # Save unoptimized lambdas
     lambdas_before = lambdas.clone().detach()
@@ -985,36 +947,36 @@ def run_lagrange_multiplier_test(global_objective,
 class CrossFunctionTest(parameterized.TestCase):
 
     @parameterized.named_parameters(
-        ('_auc01xent', loss_layers.precision_recall_auc_loss, {
+        ('_auc01xent', loss_layers.PrecisionRecallAUCLoss, {
             'precision_range': (0.0, 1.0), 'surrogate_type': 'xent'
         }),
-        ('_auc051xent', loss_layers.precision_recall_auc_loss, {
+        ('_auc051xent', loss_layers.PrecisionRecallAUCLoss, {
             'precision_range': (0.5, 1.0), 'surrogate_type': 'xent'
         }),
-        ('_auc01)hinge', loss_layers.precision_recall_auc_loss, {
+        ('_auc01)hinge', loss_layers.PrecisionRecallAUCLoss, {
             'precision_range': (0.0, 1.0), 'surrogate_type': 'hinge'
         }),
-        ('_ratp04', loss_layers.recall_at_precision_loss, {
+        ('_ratp04', loss_layers.RecallAtPrecisionLoss, {
             'target_precision': 0.4, 'surrogate_type': 'xent'
         }),
-        ('_ratp066', loss_layers.recall_at_precision_loss, {
+        ('_ratp066', loss_layers.RecallAtPrecisionLoss, {
             'target_precision': 0.66, 'surrogate_type': 'xent'
         }),
-        ('_ratp07_hinge', loss_layers.recall_at_precision_loss, {
+        ('_ratp07_hinge', loss_layers.RecallAtPrecisionLoss, {
             'target_precision': 0.7, 'surrogate_type': 'hinge'
         }),
-        ('_fpattp066', loss_layers.false_positive_rate_at_true_positive_rate_loss,
+        ('_fpattp066', loss_layers.FalsePositveRateAtTruePositiveRateLoss,
         {'target_rate': 0.66, 'surrogate_type': 'xent'}),
-        ('_fpattp046', loss_layers.false_positive_rate_at_true_positive_rate_loss,
+        ('_fpattp046', loss_layers.FalsePositveRateAtTruePositiveRateLoss,
         {
             'target_rate': 0.46, 'surrogate_type': 'xent'
         }),
         ('_fpattp076_hinge',
-        loss_layers.false_positive_rate_at_true_positive_rate_loss, {
+        loss_layers.FalsePositveRateAtTruePositiveRateLoss, {
             'target_rate': 0.76, 'surrogate_type': 'hinge'
         }),
         ('_fpattp036_hinge',
-        loss_layers.false_positive_rate_at_true_positive_rate_loss, {
+        loss_layers.FalsePositveRateAtTruePositiveRateLoss, {
             'target_rate': 0.36, 'surrogate_type': 'hinge'
         }),
     )
@@ -1042,17 +1004,15 @@ class CrossFunctionTest(parameterized.TestCase):
         weights = torch.tensor([1, 1, 1, 0, 0, 0, 2, 2, 2], dtype = torch.float32).reshape(9, 1)
 
         # Construct global objective kwargs.
-        objective_kwargs['labels'] = targets
-        objective_kwargs['logits'] = logits
         objective_kwargs['label_priors'] = priors
 
         # Unweighted loss.
-        raw_loss, update = global_objective(**objective_kwargs)
+        raw_loss, update = global_objective(**objective_kwargs).forward(targets, logits)
         loss = torch.sum(raw_loss)
 
         # Weighted loss.
         objective_kwargs['weights'] = weights
-        raw_weighted_loss, weighted_update = global_objective(**objective_kwargs)
+        raw_weighted_loss, weighted_update = global_objective(**objective_kwargs).forward(targets, logits)
         weighted_loss = torch.sum(raw_weighted_loss)
 
         lambdas = update['lambdas']
@@ -1068,40 +1028,40 @@ class CrossFunctionTest(parameterized.TestCase):
         torch.testing.assert_close(lambdas, weighted_lambdas)
 
     @parameterized.named_parameters(
-        ('_prauc051xent', loss_layers.precision_recall_auc_loss, {
+        ('_prauc051xent', loss_layers.PrecisionRecallAUCLoss, {
             'precision_range': (0.5, 1.0), 'surrogate_type': 'xent'
         }),
-        ('_prauc01hinge', loss_layers.precision_recall_auc_loss, {
+        ('_prauc01hinge', loss_layers.PrecisionRecallAUCLoss, {
             'precision_range': (0.0, 1.0), 'surrogate_type': 'hinge'
         }),
-        ('_rocxent', loss_layers.roc_auc_loss, {'surrogate_type': 'xent'}),
-        ('_rochinge', loss_layers.roc_auc_loss, {'surrogate_type': 'xent'}),
-        ('_ratp04', loss_layers.recall_at_precision_loss, {
+        ('_rocxent', loss_layers.ROCAUCLoss, {'surrogate_type': 'xent'}),
+        ('_rochinge', loss_layers.ROCAUCLoss, {'surrogate_type': 'xent'}),
+        ('_ratp04', loss_layers.RecallAtPrecisionLoss, {
             'target_precision': 0.4, 'surrogate_type': 'xent'
         }),
-        ('_ratp07_hinge', loss_layers.recall_at_precision_loss, {
+        ('_ratp07_hinge', loss_layers.RecallAtPrecisionLoss, {
             'target_precision': 0.7, 'surrogate_type': 'hinge'
         }),
-        ('_patr05', loss_layers.precision_at_recall_loss, {
+        ('_patr05', loss_layers.PrecisionAtRecallLoss, {
             'target_recall': 0.4, 'surrogate_type': 'xent'
         }),
-        ('_patr08_hinge', loss_layers.precision_at_recall_loss, {
+        ('_patr08_hinge', loss_layers.PrecisionAtRecallLoss, {
             'target_recall': 0.7, 'surrogate_type': 'hinge'
         }),
-        ('_fpattp046', loss_layers.false_positive_rate_at_true_positive_rate_loss,
+        ('_fpattp046', loss_layers.FalsePositveRateAtTruePositiveRateLoss,
         {
             'target_rate': 0.46, 'surrogate_type': 'xent'
         }),
         ('_fpattp036_hinge',
-        loss_layers.false_positive_rate_at_true_positive_rate_loss, {
+        loss_layers.FalsePositveRateAtTruePositiveRateLoss, {
             'target_rate': 0.36, 'surrogate_type': 'hinge'
         }),
-        ('_tpatfp076', loss_layers.true_positive_rate_at_false_positive_rate_loss,
+        ('_tpatfp076', loss_layers.TruePositiveRateAtFalsePositiveRateLoss,
         {
             'target_rate': 0.76, 'surrogate_type': 'xent'
         }),
         ('_tpatfp036_hinge',
-        loss_layers.true_positive_rate_at_false_positive_rate_loss, {
+        loss_layers.TruePositiveRateAtFalsePositiveRateLoss, {
             'target_rate': 0.36, 'surrogate_type': 'hinge'
         }),
     )
@@ -1114,16 +1074,12 @@ class CrossFunctionTest(parameterized.TestCase):
 
         # Construct vector global objective kwargs and loss.
         vector_kwargs = objective_kwargs.copy()
-        vector_kwargs['labels'] = vector_labels
-        vector_kwargs['logits'] = vector_logits
-        vector_loss, _ = global_objective(**vector_kwargs)
+        vector_loss, _ = global_objective(**vector_kwargs).forward(vector_labels, vector_logits)
         vector_loss_sum = torch.sum(vector_loss)
 
         # Construct matrix global objective kwargs and loss.
         matrix_kwargs = objective_kwargs.copy()
-        matrix_kwargs['labels'] = torch.unsqueeze(vector_labels, 1)
-        matrix_kwargs['logits'] = torch.unsqueeze(vector_logits, 1)
-        matrix_loss, _ = global_objective(**matrix_kwargs)
+        matrix_loss, _ = global_objective(**matrix_kwargs).forward(torch.unsqueeze(vector_labels, 1), torch.unsqueeze(vector_logits, 1))
         matrix_loss_sum = torch.sum(matrix_loss)
 
         self.assertEqual(1, vector_loss.ndim)

@@ -21,11 +21,162 @@ the loss, and a dictionary of internal quantities for customizability.
 # Dependency imports
 import numpy as np
 import torch
+import torch.nn as nn
 
 import util_pytorch as util
 
+class PrecisionRecallAUCLoss(nn.Module):
+    """Computes precision-recall AUC loss.
 
-def precision_recall_auc_loss(labels,
+    The loss is based on a sum of losses for recall at a range of
+    precision values (anchor points). This sum is a Riemann sum that
+    approximates the area under the precision-recall curve.
+
+    The per-example `weights` argument changes not only the coefficients of
+    individual training examples, but how the examples are counted toward the
+    constraint. If `label_priors` is given, it MUST take `weights` into account.
+    That is,
+        label_priors = P / (P + N)
+    where
+        P = sum_i (wt_i on positives)
+        N = sum_i (wt_i on negatives).
+
+    Args:
+    labels: A `Tensor` of shape [batch_size] or [batch_size, num_labels].
+    logits: A `Tensor` with the same shape as `labels`.
+    precision_range: A length-two tuple, the range of precision values over
+        which to compute AUC. The entries must be nonnegative, increasing, and
+        less than or equal to 1.0.
+    num_anchors: The number of grid points used to approximate the Riemann sum.
+    weights: Coefficients for the loss. Must be a scalar or `Tensor` of shape
+        [batch_size] or [batch_size, num_labels].
+    dual_rate_factor: A floating point value which controls the step size for
+        the Lagrange multipliers.
+    label_priors: None, or a floating point `Tensor` of shape [num_labels]
+        containing the prior probability of each label (i.e. the fraction of the
+        training data consisting of positive examples). If None, the label
+        priors are computed from `labels` with a moving average. See the notes
+        above regarding the interaction with `weights` and do not set this unless
+        you have a good reason to do so.
+    surrogate_type: Either 'xent' or 'hinge', specifying which upper bound
+        should be used for indicator functions.
+    lambdas_initializer: An initializer for the Lagrange multipliers.
+    trainable: If `True` also add variables to the graph collection
+        `GraphKeys.TRAINABLE_VARIABLES` (see `tf.Variable`).
+
+    Returns:
+    loss: A `Tensor` of the same shape as `logits` with the component-wise
+        loss.
+    other_outputs: A dictionary of useful internal quantities for debugging. For
+        more details, see http://arxiv.org/pdf/1608.04802.pdf.
+        lambdas: A Tensor of shape [1, num_labels, num_anchors] consisting of the
+        Lagrange multipliers.
+        biases: A Tensor of shape [1, num_labels, num_anchors] consisting of the
+        learned bias term for each.
+        label_priors: A Tensor of shape [1, num_labels, 1] consisting of the prior
+        probability of each label learned by the loss, if not provided.
+        true_positives_lower_bound: Lower bound on the number of true positives
+        given `labels` and `logits`. This is the same lower bound which is used
+        in the loss expression to be optimized.
+        false_positives_upper_bound: Upper bound on the number of false positives
+        given `labels` and `logits`. This is the same upper bound which is used
+        in the loss expression to be optimized.
+
+    Raises:
+    ValueError: If `surrogate_type` is not `xent` or `hinge`.
+    """
+    def __init__(self, precision_range = (0.0, 1.0),
+                       num_anchors = 20,
+                       weights = 1.0,
+                       dual_rate_factor = 0.1,
+                       label_priors = None,
+                       surrogate_type = 'xent',
+                       lambdas_initializer = torch.nn.init.ones_,
+                       trainable = True):
+
+        self.precision_range = precision_range
+        self.num_anchors = num_anchors
+        self.weights = weights
+        self.dual_rate_factor = dual_rate_factor
+        self.label_priors = label_priors
+        self.label_priors_obj = None
+        self.surrogate_type = surrogate_type
+        self.lambdas_initializer = lambdas_initializer
+        self.trainable = trainable
+
+    def forward(self, labels, logits):
+
+        labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
+        num_labels = util.get_num_labels(logits)
+
+        # Convert other inputs to tensors and standardize dtypes.
+        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+
+        # Create Tensor of anchor points and distance between anchors.
+        precision_values, delta = _range_to_anchors_and_delta(self.precision_range, self.num_anchors, logits.dtype)
+
+        # Create lambdas with shape [1, num_labels, num_anchors].
+        lambdas_obj = DualVariable(
+            shape = (1, num_labels, self.num_anchors),
+            dtype = logits.dtype,
+            initializer = self.lambdas_initializer,
+            trainable = self.trainable,
+            dual_rate_factor = dual_rate_factor)
+        lambdas = lambdas_obj.get_dual_variable()
+
+        # Create biases with shape [1, num_labels, num_anchors].
+        biases = torch.zeros((1, num_labels, self.num_anchors), dtype = logits.dtype, requires_grad = self.trainable)
+
+        if self.label_priors is None:
+            # Maybe create label_priors.
+            self.label_priors_obj = maybe_create_label_priors(self.label_priors_obj, labels, weights)
+            label_priors = self.label_priors_obj.label_priors
+        else:
+            label_priors = self.label_priors
+        
+        label_priors = torch.reshape(label_priors, (1, num_labels, 1))
+
+        # Expand logits, labels, and weights to shape [batch_size, num_labels, 1].
+        logits = torch.unsqueeze(logits, dim = 2)
+        labels = torch.unsqueeze(labels, dim = 2)
+        weights = torch.unsqueeze(weights, dim = 2)
+
+        # Calculate weighted loss and other outputs. The log(2.0) term corrects for
+        # logloss not being an upper bound on the indicator function.
+        loss = weights * util.weighted_surrogate_loss(
+            labels,
+            logits + biases,
+            surrogate_type = self.surrogate_type,
+            positive_weights = 1.0 + lambdas * (1.0 - precision_values),
+            negative_weights = lambdas * precision_values)
+
+        maybe_log2 = torch.log(torch.tensor([2.0])) if self.surrogate_type == 'xent' else torch.tensor([1.0])
+        maybe_log2 = maybe_log2.type(logits.dtype)
+
+        lambda_term = lambdas * (1.0 - precision_values) * label_priors * maybe_log2
+
+        per_anchor_loss = loss - lambda_term
+        per_label_loss = delta * torch.sum(per_anchor_loss, dim = 2)
+
+        # Normalize the AUC such that a perfect score function will have AUC 1.0.
+        # Because precision_range is discretized into num_anchors + 1 intervals
+        # but only num_anchors terms are included in the Riemann sum, the
+        # effective length of the integration interval is `delta` less than the
+        # length of precision_range.
+        scaled_loss = torch.div(per_label_loss, self.precision_range[1] - self.precision_range[0] - delta)
+        scaled_loss = torch.reshape(scaled_loss, original_shape)
+
+        other_outputs = {
+            'lambdas': lambdas_obj.dual_variable,
+            'biases': biases,
+            'label_priors': label_priors,
+            'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
+            'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
+
+        return scaled_loss, other_outputs
+
+
+'''def precision_recall_auc_loss(labels,
                               logits,
                               precision_range = (0.0, 1.0),
                               num_anchors = 20,
@@ -155,10 +306,70 @@ def precision_recall_auc_loss(labels,
         'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, surrogate_type),
         'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, surrogate_type)}
 
-    return scaled_loss, other_outputs
+    return scaled_loss, other_outputs'''
 
+class ROCAUCLoss(nn.Module):
+    """Computes ROC AUC loss.
 
-def roc_auc_loss(labels,
+    The area under the ROC curve is the probability p that a randomly chosen
+    positive example will be scored higher than a randomly chosen negative
+    example. This loss approximates 1-p by using a surrogate (either hinge loss or
+    cross entropy) for the indicator function. Specifically, the loss is:
+
+    sum_i sum_j w_i*w_j*loss(logit_i - logit_j)
+
+    where i ranges over the positive datapoints, j ranges over the negative
+    datapoints, logit_k denotes the logit (or score) of the k-th datapoint, and
+    loss is either the hinge or log loss given a positive label.
+
+    Args:
+    labels: A `Tensor` of shape [batch_size] or [batch_size, num_labels].
+    logits: A `Tensor` with the same shape and dtype as `labels`.
+    weights: Coefficients for the loss. Must be a scalar or `Tensor` of shape
+        [batch_size] or [batch_size, num_labels].
+    surrogate_type: Either 'xent' or 'hinge', specifying which upper bound
+        should be used for the indicator function.
+    scope: Optional scope for `name_scope`.
+
+    Returns:
+    loss: A `Tensor` of the same shape as `logits` with the component-wise loss.
+    other_outputs: An empty dictionary, for consistency.
+
+    Raises:
+    ValueError: If `surrogate_type` is not `xent` or `hinge`.
+    """
+    def __init__(self, weights = 1.0,
+                       surrogate_type = 'xent'):
+
+        self.weights = weights
+        self.surrogate_type = surrogate_type
+    
+    def forward(self, labels, logits):
+        # Convert inputs to tensors and standardize dtypes.
+        labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
+
+        # Create tensors of pairwise differences for logits and labels, and
+        # pairwise products of weights. These have shape
+        # [batch_size, batch_size, num_labels].
+        logits_difference = torch.unsqueeze(logits, dim = 0) - torch.unsqueeze(logits, dim = 1)
+        labels_difference = torch.unsqueeze(labels, dim = 0) - torch.unsqueeze(labels, dim = 1)
+        weights_product = torch.unsqueeze(weights, dim = 0) * torch.unsqueeze(weights, dim = 1)
+
+        signed_logits_difference = labels_difference * logits_difference
+        raw_loss = util.weighted_surrogate_loss(
+            labels = torch.ones_like(signed_logits_difference),
+            logits = signed_logits_difference,
+            surrogate_type = self.surrogate_type)
+        weighted_loss = weights_product * raw_loss
+
+        # Zero out entries of the loss where labels_difference zero (so loss is only
+        # computed on pairs with different labels).
+        loss = torch.mean(torch.abs(labels_difference) * weighted_loss, dim = 0) * 0.5
+        loss = torch.reshape(loss, original_shape)
+
+        return loss, {}
+
+'''def roc_auc_loss(labels,
                  logits,
                  weights = 1.0,
                  surrogate_type = 'xent'):
@@ -213,10 +424,139 @@ def roc_auc_loss(labels,
     loss = torch.mean(torch.abs(labels_difference) * weighted_loss, dim = 0) * 0.5
     loss = torch.reshape(loss, original_shape)
 
-    return loss, {}
+    return loss, {}'''
 
+class RecallAtPrecisionLoss(nn.Module):
+    """Computes recall at precision loss.
 
-def recall_at_precision_loss(labels,
+    The loss is based on a surrogate of the form
+        wt * w(+) * loss(+) + wt * w(-) * loss(-) - c * pi,
+    where:
+    - w(+) =  1 + lambdas * (1 - target_precision)
+    - loss(+) is the cross-entropy loss on the positive examples
+    - w(-) = lambdas * target_precision
+    - loss(-) is the cross-entropy loss on the negative examples
+    - wt is a scalar or tensor of per-example weights
+    - c = lambdas * (1 - target_precision)
+    - pi is the label_priors.
+
+    The per-example weights change not only the coefficients of individual
+    training examples, but how the examples are counted toward the constraint.
+    If `label_priors` is given, it MUST take `weights` into account. That is,
+        label_priors = P / (P + N)
+    where
+        P = sum_i (wt_i on positives)
+        N = sum_i (wt_i on negatives).
+
+    Args:
+    labels: A `Tensor` of shape [batch_size] or [batch_size, num_labels].
+    logits: A `Tensor` with the same shape as `labels`.
+    target_precision: The precision at which to compute the loss. Can be a
+        floating point value between 0 and 1 for a single precision value, or a
+        `Tensor` of shape [num_labels], holding each label's target precision
+        value.
+    weights: Coefficients for the loss. Must be a scalar or `Tensor` of shape
+        [batch_size] or [batch_size, num_labels].
+    dual_rate_factor: A floating point value which controls the step size for
+        the Lagrange multipliers.
+    label_priors: None, or a floating point `Tensor` of shape [num_labels]
+        containing the prior probability of each label (i.e. the fraction of the
+        training data consisting of positive examples). If None, the label
+        priors are computed from `labels` with a moving average. See the notes
+        above regarding the interaction with `weights` and do not set this unless
+        you have a good reason to do so.
+    surrogate_type: Either 'xent' or 'hinge', specifying which upper bound
+        should be used for indicator functions.
+    lambdas_initializer: An initializer for the Lagrange multipliers.
+    trainable: If `True` also add variables to the graph collection
+        `GraphKeys.TRAINABLE_VARIABLES` (see `tf.Variable`).
+    scope: Optional scope for `variable_scope`.
+
+    Returns:
+    loss: A `Tensor` of the same shape as `logits` with the component-wise
+        loss.
+    other_outputs: A dictionary of useful internal quantities for debugging. For
+        more details, see http://arxiv.org/pdf/1608.04802.pdf.
+        lambdas: A Tensor of shape [num_labels] consisting of the Lagrange
+        multipliers.
+        label_priors: A Tensor of shape [num_labels] consisting of the prior
+        probability of each label learned by the loss, if not provided.
+        true_positives_lower_bound: Lower bound on the number of true positives
+        given `labels` and `logits`. This is the same lower bound which is used
+        in the loss expression to be optimized.
+        false_positives_upper_bound: Upper bound on the number of false positives
+        given `labels` and `logits`. This is the same upper bound which is used
+        in the loss expression to be optimized.
+
+    Raises:
+    ValueError: If `logits` and `labels` do not have the same shape.
+    """
+    def __init__(self, target_precision,
+                       weights = 1.0,
+                       dual_rate_factor = 0.1,
+                       label_priors = None,
+                       surrogate_type = 'xent',
+                       lambdas_initializer = torch.nn.init.ones_,
+                       trainable = True):
+
+        self.target_precision = target_precision
+        self.weights = weights
+        self.dual_rate_factor = dual_rate_factor
+        self.label_priors = label_priors
+        self.label_priors_obj = None
+        self.surrogate_type = surrogate_type
+        self.lambdas_initializer = lambdas_initializer
+        self.trainable = trainable
+
+    def forward(self, labels, logits):
+        labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
+        num_labels = util.get_num_labels(logits)
+
+        # Convert other inputs to tensors and standardize dtypes.
+        target_precision = torch.tensor(self.target_precision).type(logits.dtype)
+        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+
+        # Create lambdas.
+        lambdas_obj = DualVariable(
+            shape = (num_labels),
+            dtype = logits.dtype,
+            initializer = self.lambdas_initializer,
+            trainable = self.trainable,
+            dual_rate_factor = dual_rate_factor)
+        lambdas = lambdas_obj.get_dual_variable()
+
+        # Maybe create label_priors.
+        if self.label_priors is None:
+            # Maybe create label_priors.
+            self.label_priors_obj = maybe_create_label_priors(self.label_priors_obj, labels, weights)
+            label_priors = self.label_priors_obj.label_priors
+        else:
+            label_priors = self.label_priors
+
+        # Calculate weighted loss and other outputs. The log(2.0) term corrects for
+        # logloss not being an upper bound on the indicator function.
+        weighted_loss = weights * util.weighted_surrogate_loss(
+            labels,
+            logits,
+            surrogate_type = self.surrogate_type,
+            positive_weights = 1.0 + lambdas * (1.0 - target_precision),
+            negative_weights = lambdas * target_precision)
+
+        maybe_log2 = torch.log(torch.tensor([2.0])) if self.surrogate_type == 'xent' else torch.tensor([1.0])
+        maybe_log2 = maybe_log2.type(logits.dtype)
+
+        lambda_term = lambdas * (1.0 - target_precision) * label_priors * maybe_log2
+        loss = torch.reshape(weighted_loss - lambda_term, original_shape)
+
+        other_outputs = {
+            'lambdas': lambdas_obj.dual_variable,
+            'label_priors': label_priors,
+            'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
+            'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
+
+        return loss, other_outputs
+
+'''def recall_at_precision_loss(labels,
                              logits,
                              target_precision,
                              weights = 1.0,
@@ -327,10 +667,130 @@ def recall_at_precision_loss(labels,
         'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, surrogate_type),
         'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, surrogate_type)}
 
-    return loss, other_outputs
+    return loss, other_outputs'''
 
+class PrecisionAtRecallLoss(nn.Module):
+    """Computes precision at recall loss.
 
-def precision_at_recall_loss(labels,
+    The loss is based on a surrogate of the form
+        wt * loss(-) + lambdas * (pi * (b - 1) + wt * loss(+))
+    where:
+    - loss(-) is the cross-entropy loss on the negative examples
+    - loss(+) is the cross-entropy loss on the positive examples
+    - wt is a scalar or tensor of per-example weights
+    - b is the target recall
+    - pi is the label_priors.
+
+    The per-example weights change not only the coefficients of individual
+    training examples, but how the examples are counted toward the constraint.
+    If `label_priors` is given, it MUST take `weights` into account. That is,
+        label_priors = P / (P + N)
+    where
+        P = sum_i (wt_i on positives)
+        N = sum_i (wt_i on negatives).
+
+    Args:
+    labels: A `Tensor` of shape [batch_size] or [batch_size, num_labels].
+    logits: A `Tensor` with the same shape as `labels`.
+    target_recall: The recall at which to compute the loss. Can be a floating
+        point value between 0 and 1 for a single target recall value, or a
+        `Tensor` of shape [num_labels] holding each label's target recall value.
+    weights: Coefficients for the loss. Must be a scalar or `Tensor` of shape
+        [batch_size] or [batch_size, num_labels].
+    dual_rate_factor: A floating point value which controls the step size for
+        the Lagrange multipliers.
+    label_priors: None, or a floating point `Tensor` of shape [num_labels]
+        containing the prior probability of each label (i.e. the fraction of the
+        training data consisting of positive examples). If None, the label
+        priors are computed from `labels` with a moving average. See the notes
+        above regarding the interaction with `weights` and do not set this unless
+        you have a good reason to do so.
+    surrogate_type: Either 'xent' or 'hinge', specifying which upper bound
+        should be used for indicator functions.
+    lambdas_initializer: An initializer for the Lagrange multipliers.
+    trainable: If `True` also add variables to the graph collection
+        `GraphKeys.TRAINABLE_VARIABLES` (see `tf.Variable`).
+
+    Returns:
+    loss: A `Tensor` of the same shape as `logits` with the component-wise
+        loss.
+    other_outputs: A dictionary of useful internal quantities for debugging. For
+        more details, see http://arxiv.org/pdf/1608.04802.pdf.
+        lambdas: A Tensor of shape [num_labels] consisting of the Lagrange
+        multipliers.
+        label_priors: A Tensor of shape [num_labels] consisting of the prior
+        probability of each label learned by the loss, if not provided.
+        true_positives_lower_bound: Lower bound on the number of true positives
+        given `labels` and `logits`. This is the same lower bound which is used
+        in the loss expression to be optimized.
+        false_positives_upper_bound: Upper bound on the number of false positives
+        given `labels` and `logits`. This is the same upper bound which is used
+        in the loss expression to be optimized.
+    """
+    def __init__(self, target_recall,
+                       weights = 1.0,
+                       dual_rate_factor = 0.1,
+                       label_priors = None,
+                       surrogate_type = 'xent',
+                       lambdas_initializer = torch.nn.init.ones_,
+                       trainable = True):
+
+        self.target_recall = target_recall
+        self.weights = weights
+        self.dual_rate_factor = dual_rate_factor
+        self.label_priors = label_priors
+        self.label_priors_obj = None
+        self.surrogate_type = surrogate_type
+        self.lambdas_initializer = lambdas_initializer
+        self.trainable = trainable
+
+    def forward(self, labels, logits):
+        labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
+        num_labels = util.get_num_labels(logits)
+
+        # Convert other inputs to tensors and standardize dtypes.
+        target_recall = torch.tensor(self.target_recall).type(logits.dtype)
+        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+
+        # Create lambdas.
+        lambdas_obj = DualVariable(
+            shape = (num_labels),
+            dtype = logits.dtype,
+            initializer = self.lambdas_initializer,
+            trainable = self.trainable,
+            dual_rate_factor = dual_rate_factor)
+        lambdas = lambdas_obj.get_dual_variable()
+
+        # Maybe create label_priors.
+        if self.label_priors is None:
+            # Maybe create label_priors.
+            self.label_priors_obj = maybe_create_label_priors(self.label_priors_obj, labels, weights)
+            label_priors = self.label_priors_obj.label_priors
+        else:
+            label_priors = self.label_priors
+
+        # Calculate weighted loss and other outputs. The log(2.0) term corrects for
+        # logloss not being an upper bound on the indicator function.
+        weighted_loss = weights * util.weighted_surrogate_loss(
+            labels,
+            logits,
+            self.surrogate_type,
+            positive_weights = lambdas,
+            negative_weights = 1.0)
+
+        maybe_log2 = torch.log(torch.tensor([2.0])) if self.surrogate_type == 'xent' else torch.tensor([1.0])
+        maybe_log2 = maybe_log2.type(logits.dtype)
+        lambda_term = lambdas * label_priors * (target_recall - 1.0) * maybe_log2
+        loss = torch.reshape(weighted_loss + lambda_term, original_shape)
+        other_outputs = {
+            'lambdas': lambdas_obj.dual_variable,
+            'label_priors': label_priors,
+            'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
+            'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
+
+        return loss, other_outputs
+
+'''def precision_at_recall_loss(labels,
                              logits,
                              target_recall,
                              weights = 1.0,
@@ -432,10 +892,137 @@ def precision_at_recall_loss(labels,
         'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, surrogate_type),
         'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, surrogate_type)}
 
-    return loss, other_outputs
+    return loss, other_outputs'''
+
+class FalsePositveRateAtTruePositiveRateLoss(nn.Module):
+    """Computes false positive rate at true positive rate loss.
+
+    Note that `true positive rate` is a synonym for Recall, and that minimizing
+    the false positive rate and maximizing precision are equivalent for a fixed
+    Recall. Therefore, this function is identical to precision_at_recall_loss.
+
+    The per-example weights change not only the coefficients of individual
+    training examples, but how the examples are counted toward the constraint.
+    If `label_priors` is given, it MUST take `weights` into account. That is,
+        label_priors = P / (P + N)
+    where
+        P = sum_i (wt_i on positives)
+        N = sum_i (wt_i on negatives).
+
+    Args:
+    labels: A `Tensor` of shape [batch_size] or [batch_size, num_labels].
+    logits: A `Tensor` with the same shape as `labels`.
+    target_rate: The true positive rate at which to compute the loss. Can be a
+        floating point value between 0 and 1 for a single true positive rate, or
+        a `Tensor` of shape [num_labels] holding each label's true positive rate.
+    weights: Coefficients for the loss. Must be a scalar or `Tensor` of shape
+        [batch_size] or [batch_size, num_labels].
+    dual_rate_factor: A floating point value which controls the step size for
+        the Lagrange multipliers.
+    label_priors: None, or a floating point `Tensor` of shape [num_labels]
+        containing the prior probability of each label (i.e. the fraction of the
+        training data consisting of positive examples). If None, the label
+        priors are computed from `labels` with a moving average. See the notes
+        above regarding the interaction with `weights` and do not set this unless
+        you have a good reason to do so.
+    surrogate_type: Either 'xent' or 'hinge', specifying which upper bound
+        should be used for indicator functions. 'xent' will use the cross-entropy
+        loss surrogate, and 'hinge' will use the hinge loss.
+    lambdas_initializer: An initializer op for the Lagrange multipliers.
+    reuse: Whether or not the layer and its variables should be reused. To be
+        able to reuse the layer scope must be given.
+    variables_collections: Optional list of collections for the variables.
+    trainable: If `True` also add variables to the graph collection
+        `GraphKeys.TRAINABLE_VARIABLES` (see `tf.Variable`).
+    scope: Optional scope for `variable_scope`.
+
+    Returns:
+    loss: A `Tensor` of the same shape as `logits` with the component-wise
+        loss.
+    other_outputs: A dictionary of useful internal quantities for debugging. For
+        more details, see http://arxiv.org/pdf/1608.04802.pdf.
+        lambdas: A Tensor of shape [num_labels] consisting of the Lagrange
+        multipliers.
+        label_priors: A Tensor of shape [num_labels] consisting of the prior
+        probability of each label learned by the loss, if not provided.
+        true_positives_lower_bound: Lower bound on the number of true positives
+        given `labels` and `logits`. This is the same lower bound which is used
+        in the loss expression to be optimized.
+        false_positives_upper_bound: Upper bound on the number of false positives
+        given `labels` and `logits`. This is the same upper bound which is used
+        in the loss expression to be optimized.
+
+    Raises:
+    ValueError: If `surrogate_type` is not `xent` or `hinge`.
+    """
+    def __init__(self, target_rate,
+                       weights = 1.0,
+                       dual_rate_factor = 0.1,
+                       label_priors = None,
+                       surrogate_type = 'xent',
+                       lambdas_initializer = torch.nn.init.ones_,
+                       trainable = True):
+        
+        self.target_rate = target_rate
+        self.weights = weights
+        self.dual_rate_factor = dual_rate_factor
+        self.label_priors = label_priors
+        self.label_priors_obj = None
+        self.surrogate_type = surrogate_type
+        self.lambdas_initializer = lambdas_initializer
+        self.trainable = trainable
+
+    def forward(self, labels, logits):
+        labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
+        num_labels = util.get_num_labels(logits)
+
+        # Convert other inputs to tensors and standardize dtypes.
+        target_rate = torch.tensor(self.target_rate).type(logits.dtype)
+        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+
+        # Create lambdas.
+        lambdas_obj = DualVariable(
+            shape = (num_labels),
+            dtype = logits.dtype,
+            initializer = self.lambdas_initializer,
+            trainable = self.trainable,
+            dual_rate_factor = dual_rate_factor)
+        lambdas = lambdas_obj.get_dual_variable()
+
+        # Maybe create label_priors.
+        if self.label_priors is None:
+            # Maybe create label_priors.
+            self.label_priors_obj = maybe_create_label_priors(self.label_priors_obj, labels, weights)
+            label_priors = self.label_priors_obj.label_priors
+        else:
+            label_priors = self.label_priors
+
+        # Loss op and other outputs. The log(2.0) term corrects for
+        # logloss not being an upper bound on the indicator function.
+        weighted_loss = weights * util.weighted_surrogate_loss(
+            labels,
+            logits,
+            surrogate_type = self.surrogate_type,
+            positive_weights = 1.0,
+            negative_weights = lambdas)
+
+        maybe_log2 = torch.log(torch.tensor([2.0])) if self.surrogate_type == 'xent' else torch.tensor([1.0])
+        maybe_log2 = maybe_log2.type(logits.dtype)
+
+        lambda_term = lambdas * target_rate * (1.0 - label_priors) * maybe_log2
+
+        loss = torch.reshape(weighted_loss - lambda_term, original_shape)
+
+        other_outputs = {
+            'lambdas': lambdas_obj.dual_variable,
+            'label_priors': label_priors,
+            'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
+            'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
+
+        return loss, other_outputs
 
 
-def false_positive_rate_at_true_positive_rate_loss(labels,
+'''def false_positive_rate_at_true_positive_rate_loss(labels,
                                                    logits,
                                                    target_rate,
                                                    weights = 1.0,
@@ -512,10 +1099,141 @@ def false_positive_rate_at_true_positive_rate_loss(labels,
                                   label_priors = label_priors,
                                   surrogate_type = surrogate_type,
                                   lambdas_initializer = lambdas_initializer,
-                                  trainable = trainable)
+                                  trainable = trainable)'''
 
+class TruePositiveRateAtFalsePositiveRateLoss(nn.Module):
+    """Computes true positive rate at false positive rate loss.
 
-def true_positive_rate_at_false_positive_rate_loss(labels,
+    The loss is based on a surrogate of the form
+        wt * loss(+) + lambdas * (wt * loss(-) - r * (1 - pi))
+    where:
+    - loss(-) is the loss on the negative examples
+    - loss(+) is the loss on the positive examples
+    - wt is a scalar or tensor of per-example weights
+    - r is the target rate
+    - pi is the label_priors.
+
+    The per-example weights change not only the coefficients of individual
+    training examples, but how the examples are counted toward the constraint.
+    If `label_priors` is given, it MUST take `weights` into account. That is,
+        label_priors = P / (P + N)
+    where
+        P = sum_i (wt_i on positives)
+        N = sum_i (wt_i on negatives).
+
+    Args:
+    labels: A `Tensor` of shape [batch_size] or [batch_size, num_labels].
+    logits: A `Tensor` with the same shape as `labels`.
+    target_rate: The false positive rate at which to compute the loss. Can be a
+        floating point value between 0 and 1 for a single false positive rate, or
+        a `Tensor` of shape [num_labels] holding each label's false positive rate.
+    weights: Coefficients for the loss. Must be a scalar or `Tensor` of shape
+        [batch_size] or [batch_size, num_labels].
+    dual_rate_factor: A floating point value which controls the step size for
+        the Lagrange multipliers.
+    label_priors: None, or a floating point `Tensor` of shape [num_labels]
+        containing the prior probability of each label (i.e. the fraction of the
+        training data consisting of positive examples). If None, the label
+        priors are computed from `labels` with a moving average. See the notes
+        above regarding the interaction with `weights` and do not set this unless
+        you have a good reason to do so.
+    surrogate_type: Either 'xent' or 'hinge', specifying which upper bound
+        should be used for indicator functions. 'xent' will use the cross-entropy
+        loss surrogate, and 'hinge' will use the hinge loss.
+    lambdas_initializer: An initializer op for the Lagrange multipliers.
+    reuse: Whether or not the layer and its variables should be reused. To be
+        able to reuse the layer scope must be given.
+    variables_collections: Optional list of collections for the variables.
+    trainable: If `True` also add variables to the graph collection
+        `GraphKeys.TRAINABLE_VARIABLES` (see `tf.Variable`).
+    scope: Optional scope for `variable_scope`.
+
+    Returns:
+    loss: A `Tensor` of the same shape as `logits` with the component-wise
+        loss.
+    other_outputs: A dictionary of useful internal quantities for debugging. For
+        more details, see http://arxiv.org/pdf/1608.04802.pdf.
+        lambdas: A Tensor of shape [num_labels] consisting of the Lagrange
+        multipliers.
+        label_priors: A Tensor of shape [num_labels] consisting of the prior
+        probability of each label learned by the loss, if not provided.
+        true_positives_lower_bound: Lower bound on the number of true positives
+        given `labels` and `logits`. This is the same lower bound which is used
+        in the loss expression to be optimized.
+        false_positives_upper_bound: Upper bound on the number of false positives
+        given `labels` and `logits`. This is the same upper bound which is used
+        in the loss expression to be optimized.
+
+    Raises:
+    ValueError: If `surrogate_type` is not `xent` or `hinge`.
+    """
+    def __init__(self, target_rate,
+                       weights = 1.0,
+                       dual_rate_factor = 0.1,
+                       label_priors = None,
+                       surrogate_type = 'xent',
+                       lambdas_initializer = torch.nn.init.ones_,
+                       trainable = True):
+
+        self.target_rate = target_rate
+        self.weights = weights
+        self.dual_rate_factor = dual_rate_factor
+        self.label_priors = label_priors
+        self.label_priors_obj = None
+        self.surrogate_type = surrogate_type
+        self.lambdas_initializer = lambdas_initializer
+        self.trainable = trainable
+
+    def forward(self, labels, logits):
+        labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
+        num_labels = util.get_num_labels(logits)
+
+        # Convert other inputs to tensors and standardize dtypes.
+        target_rate = torch.tensor(self.target_rate).type(logits.dtype)
+        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+
+        # Create lambdas.
+        lambdas_obj = DualVariable(
+            shape = (num_labels),
+            dtype = logits.dtype,
+            initializer = self.lambdas_initializer,
+            trainable = self.trainable,
+            dual_rate_factor = dual_rate_factor)
+        lambdas = lambdas_obj.get_dual_variable()
+
+        # Maybe create label_priors.
+        if self.label_priors is None:
+            # Maybe create label_priors.
+            self.label_priors_obj = maybe_create_label_priors(self.label_priors_obj, labels, weights)
+            label_priors = self.label_priors_obj.label_priors
+        else:
+            label_priors = self.label_priors
+
+        # Loss op and other outputs. The log(2.0) term corrects for
+        # logloss not being an upper bound on the indicator function.
+        weighted_loss = weights * util.weighted_surrogate_loss(
+            labels,
+            logits,
+            surrogate_type = self.surrogate_type,
+            positive_weights = 1.0,
+            negative_weights = lambdas)
+
+        maybe_log2 = torch.log(torch.tensor([2.0])) if self.surrogate_type == 'xent' else torch.tensor([1.0])
+        maybe_log2 = maybe_log2.type(logits.dtype)
+
+        lambda_term = lambdas * target_rate * (1.0 - label_priors) * maybe_log2
+
+        loss = torch.reshape(weighted_loss - lambda_term, original_shape)
+
+        other_outputs = {
+            'lambdas': lambdas_obj.dual_variable,
+            'label_priors': label_priors,
+            'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
+            'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
+
+        return loss, other_outputs
+
+'''def true_positive_rate_at_false_positive_rate_loss(labels,
                                                    logits,
                                                    target_rate,
                                                    weights = 1.0,
@@ -628,7 +1346,7 @@ def true_positive_rate_at_false_positive_rate_loss(labels,
         'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, surrogate_type),
         'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, surrogate_type)}
 
-    return loss, other_outputs
+    return loss, other_outputs'''
 
 
 def _prepare_labels_logits_weights(labels, logits, weights):
@@ -711,8 +1429,48 @@ def _range_to_anchors_and_delta(precision_range, num_anchors, dtype):
 
     return precision_values, delta
 
-# NEED torch.autograd.forward_ad.make_dual()??????
-def _create_dual_variable(shape, dtype, initializer, trainable, dual_rate_factor):
+class DualVariable():
+    """Creates a new dual variable.
+
+    Dual variables are required to be nonnegative. If trainable, their gradient
+    is reversed so that they are maximized (rather than minimized) by the
+    optimizer.
+
+    Args:
+    name: A string, the name for the new variable.
+    shape: Shape of the new variable.
+    dtype: Data type for the new variable.
+    initializer: Initializer for the new variable.
+    trainable: If `True`, the default, also adds the variable to the graph
+        collection `GraphKeys.TRAINABLE_VARIABLES`. This collection is used as
+        the default list of variables to use by the `Optimizer` classes.
+    dual_rate_factor: A floating point value or `Tensor`. The learning rate for
+        the dual variable is scaled by this factor.
+
+    Returns:
+    dual_value: An op that computes the absolute value of the dual variable
+        and reverses its gradient.
+    dual_variable: The underlying variable itself.
+    """
+    def __init__(self, shape, dtype, initializer, trainable, dual_rate_factor):
+        self.trainable = trainable
+        self.dual_rate_factor = dual_rate_factor
+        self.dual_variable = initializer(torch.empty(shape, dtype = dtype)).requires_grad_(trainable)
+
+    def get_dual_variable(self):
+        # Using the absolute value enforces nonnegativity.
+        dual_value = torch.abs(self.dual_variable)
+
+        if self.trainable:
+            # To reverse the gradient on the dual variable, multiply the gradient by
+            # -dual_rate_factor
+            dual_value = (1.0 + self.dual_rate_factor) * dual_value.detach().clone() - self.dual_rate_factor * dual_value.detach().clone()
+            dual_value.requires_grad_(True)
+
+        return dual_value
+
+# NEED torch.autograd.forward_ad.make_dual()?????? yeeee
+'''def _create_dual_variable(shape, dtype, initializer, trainable, dual_rate_factor):
     """Creates a new dual variable.
 
     Dual variables are required to be nonnegative. If trainable, their gradient
@@ -747,10 +1505,10 @@ def _create_dual_variable(shape, dtype, initializer, trainable, dual_rate_factor
         dual_value = (1.0 + dual_rate_factor) * dual_value.detach().clone() - dual_rate_factor * dual_value.detach().clone()
         dual_value.requires_grad_(True)
 
-    return dual_value, dual_variable
+    return dual_value, dual_variable'''
 
 
-def maybe_create_label_priors(label_priors, labels, weights):
+def maybe_create_label_priors(label_priors_obj, labels, weights):
     """Creates moving average ops to track label priors, if necessary.
 
     Args:
@@ -762,13 +1520,14 @@ def maybe_create_label_priors(label_priors, labels, weights):
     label_priors: A Tensor of shape [num_labels] consisting of the
         weighted label priors, after updating with moving average ops if created.
     """
-    if label_priors is not None:
-        label_priors = torch.as_tensor(label_priors).type(labels.dtype)
-        return torch.squeeze(label_priors)
+    if label_priors_obj is not None:
+        #torch.as_tensor(label_priors).type(labels.dtype)
+        label_priors_obj.update_label_priors(labels, weights)
+        return torch.squeeze(label_priors_obj.label_priors)
 
-    label_priors = util.build_label_priors(labels, weights)
+    label_priors_obj = util.LabelPriors(labels, weights)
 
-    return label_priors
+    return label_priors_obj
 
 
 def true_positives_lower_bound(labels, logits, weights, surrogate_type):
