@@ -99,33 +99,42 @@ class PrecisionRecallAUCLoss(nn.Module):
         self.weights = weights
         self.dual_rate_factor = dual_rate_factor
         self.label_priors = label_priors
-        self.label_priors_obj = None
         self.surrogate_type = surrogate_type
         self.lambdas_initializer = lambdas_initializer
         self.trainable = trainable
+
+        self.precision_values = None
+        self.delta = None
+        self.lambdas_obj = None
+        self.label_priors_obj = None
+        self.biases = None
 
     def forward(self, labels, logits):
 
         labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
         num_labels = util.get_num_labels(logits)
 
-        # Convert other inputs to tensors and standardize dtypes.
-        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+        if self.precision_values is None:
+            # Create Tensor of anchor points and distance between anchors.
+            self.precision_values, self.delta = _range_to_anchors_and_delta(self.precision_range, self.num_anchors, logits.dtype)
 
-        # Create Tensor of anchor points and distance between anchors.
-        precision_values, delta = _range_to_anchors_and_delta(self.precision_range, self.num_anchors, logits.dtype)
+        if self.lambdas_obj is None:
+            # Convert other inputs to tensors and standardize dtypes.
+            dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
 
-        # Create lambdas with shape [1, num_labels, num_anchors].
-        lambdas_obj = DualVariable(
-            shape = (1, num_labels, self.num_anchors),
-            dtype = logits.dtype,
-            initializer = self.lambdas_initializer,
-            trainable = self.trainable,
-            dual_rate_factor = dual_rate_factor)
-        lambdas = lambdas_obj.get_dual_variable()
+            # Create lambdas with shape [1, num_labels, num_anchors].
+            self.lambdas_obj = DualVariable(
+                shape = (1, num_labels, self.num_anchors),
+                dtype = logits.dtype,
+                initializer = self.lambdas_initializer,
+                trainable = self.trainable,
+                dual_rate_factor = dual_rate_factor)
 
-        # Create biases with shape [1, num_labels, num_anchors].
-        biases = torch.zeros((1, num_labels, self.num_anchors), dtype = logits.dtype, requires_grad = self.trainable)
+        lambdas = self.lambdas_obj.dual_variable
+
+        if self.biases is None:
+            # Create biases with shape [1, num_labels, num_anchors].
+            self.biases = torch.zeros((1, num_labels, self.num_anchors), dtype = logits.dtype, requires_grad = self.trainable)
 
         if self.label_priors is None:
             # Maybe create label_priors.
@@ -145,30 +154,30 @@ class PrecisionRecallAUCLoss(nn.Module):
         # logloss not being an upper bound on the indicator function.
         loss = weights * util.weighted_surrogate_loss(
             labels,
-            logits + biases,
+            logits + self.biases,
             surrogate_type = self.surrogate_type,
-            positive_weights = 1.0 + lambdas * (1.0 - precision_values),
-            negative_weights = lambdas * precision_values)
+            positive_weights = 1.0 + lambdas * (1.0 - self.precision_values),
+            negative_weights = lambdas * self.precision_values)
 
         maybe_log2 = torch.log(torch.tensor([2.0])) if self.surrogate_type == 'xent' else torch.tensor([1.0])
         maybe_log2 = maybe_log2.type(logits.dtype)
 
-        lambda_term = lambdas * (1.0 - precision_values) * label_priors * maybe_log2
+        lambda_term = lambdas * (1.0 - self.precision_values) * label_priors * maybe_log2
 
         per_anchor_loss = loss - lambda_term
-        per_label_loss = delta * torch.sum(per_anchor_loss, dim = 2)
+        per_label_loss = self.delta * torch.sum(per_anchor_loss, dim = 2)
 
         # Normalize the AUC such that a perfect score function will have AUC 1.0.
         # Because precision_range is discretized into num_anchors + 1 intervals
         # but only num_anchors terms are included in the Riemann sum, the
         # effective length of the integration interval is `delta` less than the
         # length of precision_range.
-        scaled_loss = torch.div(per_label_loss, self.precision_range[1] - self.precision_range[0] - delta)
+        scaled_loss = torch.div(per_label_loss, self.precision_range[1] - self.precision_range[0] - self.delta)
         scaled_loss = torch.reshape(scaled_loss, original_shape)
 
         other_outputs = {
-            'lambdas': lambdas_obj.dual_variable,
-            'biases': biases,
+            'lambdas': self.lambdas_obj,
+            'biases': self.biases,
             'label_priors': label_priors,
             'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
             'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
@@ -432,7 +441,7 @@ class RecallAtPrecisionLoss(nn.Module):
     The loss is based on a surrogate of the form
         wt * w(+) * loss(+) + wt * w(-) * loss(-) - c * pi,
     where:
-    - w(+) =  1 + lambdas * (1 - target_precision)
+    - w(+) =  1 + lambdas * (1 - target_precision)                  ----------- why not (1 + lambdas)???
     - loss(+) is the cross-entropy loss on the positive examples
     - w(-) = lambdas * target_precision
     - loss(-) is the cross-entropy loss on the negative examples
@@ -503,10 +512,12 @@ class RecallAtPrecisionLoss(nn.Module):
         self.weights = weights
         self.dual_rate_factor = dual_rate_factor
         self.label_priors = label_priors
-        self.label_priors_obj = None
         self.surrogate_type = surrogate_type
         self.lambdas_initializer = lambdas_initializer
         self.trainable = trainable
+        
+        self.lambdas_obj = None
+        self.label_priors_obj = None
 
     def forward(self, labels, logits):
         labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
@@ -514,16 +525,19 @@ class RecallAtPrecisionLoss(nn.Module):
 
         # Convert other inputs to tensors and standardize dtypes.
         target_precision = torch.tensor(self.target_precision).type(logits.dtype)
-        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+        
+        if self.lambdas_obj is None:
+            dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
 
-        # Create lambdas.
-        lambdas_obj = DualVariable(
-            shape = (num_labels),
-            dtype = logits.dtype,
-            initializer = self.lambdas_initializer,
-            trainable = self.trainable,
-            dual_rate_factor = dual_rate_factor)
-        lambdas = lambdas_obj.get_dual_variable()
+            # Create lambdas.
+            self.lambdas_obj = DualVariable(
+                shape = (num_labels),
+                dtype = logits.dtype,
+                initializer = self.lambdas_initializer,
+                trainable = self.trainable,
+                dual_rate_factor = dual_rate_factor)
+
+        lambdas = self.lambdas_obj.dual_variable
 
         # Maybe create label_priors.
         if self.label_priors is None:
@@ -549,7 +563,7 @@ class RecallAtPrecisionLoss(nn.Module):
         loss = torch.reshape(weighted_loss - lambda_term, original_shape)
 
         other_outputs = {
-            'lambdas': lambdas_obj.dual_variable,
+            'lambdas': self.lambdas_obj,
             'label_priors': label_priors,
             'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
             'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
@@ -739,10 +753,12 @@ class PrecisionAtRecallLoss(nn.Module):
         self.weights = weights
         self.dual_rate_factor = dual_rate_factor
         self.label_priors = label_priors
-        self.label_priors_obj = None
         self.surrogate_type = surrogate_type
         self.lambdas_initializer = lambdas_initializer
         self.trainable = trainable
+
+        self.lambdas_obj = None
+        self.label_priors_obj = None
 
     def forward(self, labels, logits):
         labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
@@ -750,16 +766,19 @@ class PrecisionAtRecallLoss(nn.Module):
 
         # Convert other inputs to tensors and standardize dtypes.
         target_recall = torch.tensor(self.target_recall).type(logits.dtype)
-        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+        
+        if self.lambdas_obj is None:
+            dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
 
-        # Create lambdas.
-        lambdas_obj = DualVariable(
-            shape = (num_labels),
-            dtype = logits.dtype,
-            initializer = self.lambdas_initializer,
-            trainable = self.trainable,
-            dual_rate_factor = dual_rate_factor)
-        lambdas = lambdas_obj.get_dual_variable()
+            # Create lambdas.
+            self.lambdas_obj = DualVariable(
+                shape = (num_labels),
+                dtype = logits.dtype,
+                initializer = self.lambdas_initializer,
+                trainable = self.trainable,
+                dual_rate_factor = dual_rate_factor)
+            
+        lambdas = self.lambdas_obj.dual_variable
 
         # Maybe create label_priors.
         if self.label_priors is None:
@@ -783,7 +802,7 @@ class PrecisionAtRecallLoss(nn.Module):
         lambda_term = lambdas * label_priors * (target_recall - 1.0) * maybe_log2
         loss = torch.reshape(weighted_loss + lambda_term, original_shape)
         other_outputs = {
-            'lambdas': lambdas_obj.dual_variable,
+            'lambdas': self.lambdas_obj,
             'label_priors': label_priors,
             'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
             'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
@@ -967,10 +986,12 @@ class FalsePositveRateAtTruePositiveRateLoss(nn.Module):
         self.weights = weights
         self.dual_rate_factor = dual_rate_factor
         self.label_priors = label_priors
-        self.label_priors_obj = None
         self.surrogate_type = surrogate_type
         self.lambdas_initializer = lambdas_initializer
         self.trainable = trainable
+
+        self.lambdas_obj = None
+        self.label_priors_obj = None
 
     def forward(self, labels, logits):
         labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
@@ -978,16 +999,19 @@ class FalsePositveRateAtTruePositiveRateLoss(nn.Module):
 
         # Convert other inputs to tensors and standardize dtypes.
         target_rate = torch.tensor(self.target_rate).type(logits.dtype)
-        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
 
-        # Create lambdas.
-        lambdas_obj = DualVariable(
-            shape = (num_labels),
-            dtype = logits.dtype,
-            initializer = self.lambdas_initializer,
-            trainable = self.trainable,
-            dual_rate_factor = dual_rate_factor)
-        lambdas = lambdas_obj.get_dual_variable()
+        if self.lambdas_obj is None:
+            dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+
+            # Create lambdas.
+            self.lambdas_obj = DualVariable(
+                shape = (num_labels),
+                dtype = logits.dtype,
+                initializer = self.lambdas_initializer,
+                trainable = self.trainable,
+                dual_rate_factor = dual_rate_factor)
+
+        lambdas = self.lambdas_obj.dual_variable
 
         # Maybe create label_priors.
         if self.label_priors is None:
@@ -1014,7 +1038,7 @@ class FalsePositveRateAtTruePositiveRateLoss(nn.Module):
         loss = torch.reshape(weighted_loss - lambda_term, original_shape)
 
         other_outputs = {
-            'lambdas': lambdas_obj.dual_variable,
+            'lambdas': self.lambdas_obj,
             'label_priors': label_priors,
             'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
             'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
@@ -1179,10 +1203,12 @@ class TruePositiveRateAtFalsePositiveRateLoss(nn.Module):
         self.weights = weights
         self.dual_rate_factor = dual_rate_factor
         self.label_priors = label_priors
-        self.label_priors_obj = None
         self.surrogate_type = surrogate_type
         self.lambdas_initializer = lambdas_initializer
         self.trainable = trainable
+
+        self.lambdas_obj = None
+        self.label_priors_obj = None
 
     def forward(self, labels, logits):
         labels, logits, weights, original_shape = _prepare_labels_logits_weights(labels, logits, self.weights)
@@ -1190,16 +1216,19 @@ class TruePositiveRateAtFalsePositiveRateLoss(nn.Module):
 
         # Convert other inputs to tensors and standardize dtypes.
         target_rate = torch.tensor(self.target_rate).type(logits.dtype)
-        dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
+        
+        if self.lambdas_obj is None:
+            dual_rate_factor = torch.tensor(self.dual_rate_factor).type(logits.dtype)
 
-        # Create lambdas.
-        lambdas_obj = DualVariable(
-            shape = (num_labels),
-            dtype = logits.dtype,
-            initializer = self.lambdas_initializer,
-            trainable = self.trainable,
-            dual_rate_factor = dual_rate_factor)
-        lambdas = lambdas_obj.get_dual_variable()
+            # Create lambdas.
+            self.lambdas_obj = DualVariable(
+                shape = (num_labels),
+                dtype = logits.dtype,
+                initializer = self.lambdas_initializer,
+                trainable = self.trainable,
+                dual_rate_factor = dual_rate_factor)
+
+        lambdas = self.lambdas_obj.dual_variable
 
         # Maybe create label_priors.
         if self.label_priors is None:
@@ -1226,7 +1255,7 @@ class TruePositiveRateAtFalsePositiveRateLoss(nn.Module):
         loss = torch.reshape(weighted_loss - lambda_term, original_shape)
 
         other_outputs = {
-            'lambdas': lambdas_obj.dual_variable,
+            'lambdas': self.lambdas_obj,
             'label_priors': label_priors,
             'true_positives_lower_bound': true_positives_lower_bound(labels, logits, weights, self.surrogate_type),
             'false_positives_upper_bound': false_positives_upper_bound(labels, logits, weights, self.surrogate_type)}
@@ -1390,7 +1419,7 @@ def _prepare_labels_logits_weights(labels, logits, weights):
 
     if weights.ndim <= 1:
         # Weights has shape [batch_size]. Reshape to [batch_size, 1].
-        weights = torch.reshape(weights, (-1, 1))
+        weights = torch.broadcast_to(weights, (labels.shape[0], 1))
     if weights.ndim == 0:
         # Weights is a scalar. Change shape of weights to match logits.
         weights *= torch.ones_like(logits)
@@ -1457,19 +1486,10 @@ class DualVariable():
         self.dual_rate_factor = dual_rate_factor
         self.dual_variable = initializer(torch.empty(shape, dtype = dtype)).requires_grad_(trainable)
 
-    def get_dual_variable(self):
+    def nonnegativity_constraint(self):
         # Using the absolute value enforces nonnegativity.
-        dual_value = torch.abs(self.dual_variable)
+        self.dual_variable = torch.abs(self.dual_variable.detach()).requires_grad_(True)
 
-        if self.trainable:
-            # To reverse the gradient on the dual variable, multiply the gradient by
-            # -dual_rate_factor
-            dual_value = (1.0 + self.dual_rate_factor) * dual_value.detach().clone() - self.dual_rate_factor * dual_value.detach().clone()
-            dual_value.requires_grad_(True)
-
-        return dual_value
-
-# NEED torch.autograd.forward_ad.make_dual()?????? yeeee
 '''def _create_dual_variable(shape, dtype, initializer, trainable, dual_rate_factor):
     """Creates a new dual variable.
 
@@ -1493,7 +1513,6 @@ class DualVariable():
         and reverses its gradient.
     dual_variable: The underlying variable itself.
     """
-    # NEED torch.autograd.forward_ad.make_dual()?????? yes...?
     dual_variable = initializer(torch.empty(shape, dtype = dtype)).requires_grad_(trainable)
 
     # Using the absolute value enforces nonnegativity.
@@ -1523,7 +1542,7 @@ def maybe_create_label_priors(label_priors_obj, labels, weights):
     if label_priors_obj is not None:
         #torch.as_tensor(label_priors).type(labels.dtype)
         label_priors_obj.update_label_priors(labels, weights)
-        return torch.squeeze(label_priors_obj.label_priors)
+        return label_priors_obj
 
     label_priors_obj = util.LabelPriors(labels, weights)
 

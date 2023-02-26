@@ -799,23 +799,27 @@ class UtilityFunctionsTest(parameterized.TestCase):
 
     def testTrainableDualVariable(self):
         # Confirm correct behavior of a trainable dual variable.
-        x = torch.tensor([2.0], dtype = torch.float32, requires_grad = True) # primal
+        x = torch.tensor([2.0], dtype = torch.float32, requires_grad = True)
         lambda_obj = loss_layers.DualVariable(
             shape = (1,), dtype = torch.float32, initializer = torch.nn.init.ones_,
             trainable = True, dual_rate_factor = 0.3)
         y_value = lambda_obj.dual_variable
-        optimizer = torch.optim.SGD([x, y_value], lr = 1.0)
+        optimizer = torch.optim.SGD([
+            {'params': x}, 
+            {'params': y_value, 'lr': -0.3}
+            ], lr = 1.0)
         # Update parameters once(?)
         loss = 0.5 * torch.square(x - y_value);
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        lambda_obj.nonnegativity_constraint()
 
-        torch.testing.assert_close(torch.tensor([0.7]), lambda_obj.get_dual_variable())
+        torch.testing.assert_close(torch.tensor([0.7]), lambda_obj.dual_variable)
 
     def testUntrainableDualVariable(self):
         # Confirm correct behavior of dual variable which is not trainable.
-        x = torch.tensor([-2.0], dtype = torch.float32, requires_grad = True) # primal
+        x = torch.tensor([-2.0], dtype = torch.float32, requires_grad = True)
         lambda_obj = loss_layers.DualVariable(
             shape = (1,), dtype = torch.float32, initializer = torch.nn.init.ones_,
             trainable = False, dual_rate_factor = 0.8)
@@ -826,8 +830,9 @@ class UtilityFunctionsTest(parameterized.TestCase):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        lambda_obj.nonnegativity_constraint()
 
-        torch.testing.assert_close(torch.tensor([1.0]), lambda_obj.get_dual_variable())
+        torch.testing.assert_close(torch.tensor([1.0]), lambda_obj.dual_variable)
 
 
 class BoundTest(parameterized.TestCase):
@@ -926,11 +931,12 @@ def run_lagrange_multiplier_test(global_objective,
     kwargs['label_priors'] = priors
 
     loss, output_dict = global_objective(**kwargs).forward(targets, logits)
-    lambdas = torch.squeeze(output_dict['lambdas'])
+    lambdas_obj = output_dict['lambdas']
+    lambdas = torch.squeeze(lambdas_obj.dual_variable)
     # Save unoptimized lambdas
     lambdas_before = lambdas.clone().detach()
 
-    optimizer = torch.optim.SGD([output_dict['lambdas']], lr = 1.0)
+    optimizer = torch.optim.SGD([{'params':lambdas_obj.dual_variable, 'lr' : -lambdas_obj.dual_rate_factor}], lr = 1.0)
     # Update parameters once(?)
     loss = torch.sum(loss) ##????
     optimizer.zero_grad()
@@ -1015,8 +1021,8 @@ class CrossFunctionTest(parameterized.TestCase):
         raw_weighted_loss, weighted_update = global_objective(**objective_kwargs).forward(targets, logits)
         weighted_loss = torch.sum(raw_weighted_loss)
 
-        lambdas = update['lambdas']
-        weighted_lambdas = weighted_update['lambdas']
+        lambdas = update['lambdas'].dual_variable
+        weighted_lambdas = weighted_update['lambdas'].dual_variable
         logits_gradient = torch.autograd.grad(loss, dummy, retain_graph = True)
         weighted_logits_gradient = torch.autograd.grad(weighted_loss, dummy)
 
