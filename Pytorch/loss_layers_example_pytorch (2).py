@@ -24,6 +24,7 @@ from __future__ import print_function
 
 # Dependency imports
 import numpy as np
+from sklearn.metrics import recall_score
 from sklearn.metrics import precision_score
 import torch
 import loss_layers_pytorch as loss_layers
@@ -34,10 +35,10 @@ import matplotlib.pyplot as plt
 # otherwise by dedicated saddle-point steps as part of the optimization loop.
 USE_GO_SADDLE_POINT_OPT = False
 
-TARGET_RECALL = 0.9
-TRAIN_ITERATIONS = 400
-LEARNING_RATE = 2
-GO_DUAL_RATE_FACTOR = 1.2
+TARGET_PRECISION = 0.9
+TRAIN_ITERATIONS = 240
+LEARNING_RATE = 1
+GO_DUAL_RATE_FACTOR = 15
 NUM_CHECKPOINTS = 12
 
 EXPERIMENT_DATA_CONFIG = {
@@ -114,24 +115,25 @@ def create_training_and_eval_data_for_experiment(**data_config):
 def train_model(data, use_global_objectives):
     """Trains a linear model for maximal accuracy or precision at given recall."""
 
-    def precision_at_recall(scores, labels, target_recall):
-        """Computes precision - at target recall - over data."""
+    def recall_at_precision(scores, labels, target_precision):
+        """Computes recall - at target precision - over data."""
         positive_scores = scores[labels == 1.0]
-        threshold = np.percentile(positive_scores, 100 - target_recall*100)
+        threshold = np.percentile(positive_scores, 100 - target_precision*100)
         predicted = scores >= threshold
         return precision_score(labels, predicted)
 
     w = torch.tensor([-1.0, -1.0], dtype = torch.float32).reshape(2, 1).requires_grad_() # Weights
     b = torch.zeros([1], dtype = torch.float32, requires_grad = True) # Biases
 
+    logits = torch.matmul(torch.tensor(data['train_data'], dtype = torch.float32), w) + b
     labels = torch.tensor(data['train_labels'], dtype = torch.float32).reshape(-1, 1)
 
     optimizer = torch.optim.SGD([w, b], lr = LEARNING_RATE)
 
-    #scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters = TRAIN_ITERATIONS, power = 1.0)
+    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters = TRAIN_ITERATIONS, power = 1.0)
 
     if use_global_objectives:
-        loss_function = loss_layers.PrecisionAtRecallLoss(TARGET_RECALL,
+        loss_function = loss_layers.RecallAtPrecisionLoss(TARGET_PRECISION,
                                                           dual_rate_factor = GO_DUAL_RATE_FACTOR,
                                                           surrogate_type = 'hinge')
     else:
@@ -143,62 +145,66 @@ def train_model(data, use_global_objectives):
     lambda_values = np.zeros(TRAIN_ITERATIONS, dtype = np.float32)
 
     for step in range(TRAIN_ITERATIONS):
-        logits = torch.matmul(torch.tensor(data['train_data'], dtype = torch.float32), w) + b
-
         if (not use_global_objectives) or USE_GO_SADDLE_POINT_OPT:
-            loss = loss_function.forward(logits, labels)
+            loss = loss_function.forward(labels, logits)
 
             optimizer.zero_grad()
             loss.backward(retain_graph = True)
             optimizer.step()
-            #scheduler.step()
+            scheduler.step()
         else:
-            loss, other_outputs = loss_function.forward(labels, logits)
-            loss = torch.mean(loss)
+            for i in range(1):
+                loss, other_outputs = loss_function.forward(labels, logits)
+                loss = torch.mean(loss)
 
-            other_outputs['lambdas'].update(loss)
+                lambdas = other_outputs['lambdas'].dual_variable
+
+                lambda_optimizer = torch.optim.SGD([{'params': lambdas, 'lr': -other_outputs['lambdas'].dual_rate_factor}])
+
+                lambda_optimizer.zero_grad()
+                loss.backward(retain_graph = True)
+                lambda_optimizer.step()
+
+                other_outputs['lambdas'].nonnegativity_constraint()
+
+                lambda_values[step] = lambdas.detach().float()
+
+                if step > TRAIN_ITERATIONS / 3:
+                    other_outputs['lambdas'].reset()
 
             optimizer.zero_grad()
             loss.backward(retain_graph = True)
             optimizer.step()
 
-            #scheduler.step()
-
-            # Store lambda to plot
-            lambda_values[step] = other_outputs['lambdas'].dual_variable.detach().float()
-
-        #lambda_values[step] = b.detach().float()
+            scheduler.step()
 
         if step % checkpoint_step == 0:
-            precision = precision_at_recall(
+            recall = recall_at_precision(
                 np.dot(data['train_data'], w.detach().numpy()) + b.detach().numpy(),
-                data['train_labels'], TARGET_RECALL)
+                data['train_labels'], TARGET_PRECISION)
 
-            print('Loss = %f Precision = %f' % (loss, precision))
+            print('Loss = %f Recall = %f' % (loss, recall))
             if use_global_objectives:
                 other_outputs['lambdas'] = np.mean(other_outputs['lambdas'].dual_variable.detach().numpy())
                 for i, output_name in enumerate(other_outputs.keys()):
                     print('\t%s = %f' % (output_name, other_outputs[output_name]))
 
     plt.plot(lambda_values)
-    plt.title("Lagrange Multiplier Value vs. Epoch")
-    plt.xlabel("Epoch")
-    plt.ylabel("Lagrange Multiplier Value")
     plt.show()
 
-    return precision_at_recall(np.dot(data['eval_data'], w.detach().numpy()) + b.detach().numpy(),
+    return recall_at_precision(np.dot(data['eval_data'], w.detach().numpy()) + b.detach().numpy(),
                                data['eval_labels'],
-                               TARGET_RECALL)
+                               TARGET_PRECISION)
 
 
 def main():
     experiment_data = create_training_and_eval_data_for_experiment(**EXPERIMENT_DATA_CONFIG)
 
-    global_objectives_loss_precision = train_model(experiment_data, True)
-    print('global_objectives precision at requested recall is %f' % global_objectives_loss_precision)
+    global_objectives_loss_recall = train_model(experiment_data, True)
+    print('global_objectives recall at requested precision is %f' % global_objectives_loss_recall)
 
-    cross_entropy_loss_precision = train_model(experiment_data, False)
-    print('cross_entropy precision at requested recall is %f' % cross_entropy_loss_precision)
+    cross_entropy_loss_recall = train_model(experiment_data, False)
+    print('cross_entropy recall at requested precision is %f' % cross_entropy_loss_recall)
 
 
 if __name__ == '__main__':

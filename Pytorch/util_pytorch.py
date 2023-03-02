@@ -151,7 +151,7 @@ def weighted_surrogate_loss(labels,
         2D tensor - of size [num_labels, K'] where K' is either K or 1.
         The `positive_weights` will be expanded to the left to match the
         dimensions of logits and labels.
-    negative_weights: A `Tensor` that holds positive weight and has the
+    negative_weights: A `Tensor` that holds positive weights and has the
         semantics identical to positive_weights.
 
     Returns:

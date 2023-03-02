@@ -1,7 +1,9 @@
 {
   "ExpandedNodes": [
-    ""
+    "",
+    "\\Pytorch",
+    "\\TensorFlow"
   ],
-  "SelectedNode": "\\C:\\Users\\thatf\\OneDrive\\Documents\\GitHub\\global_objectives_pytorch",
+  "SelectedNode": "\\Pytorch\\loss_layers_example_pytorch (2).py",
   "PreviewInSolutionExplorer": false
 }

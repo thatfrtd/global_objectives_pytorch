@@ -794,13 +794,13 @@ class PrecisionAtRecallLoss(nn.Module):
             labels,
             logits,
             self.surrogate_type,
-            positive_weights = lambdas,
+            positive_weights = lambdas,# label_priors needed to match stated surrogate...
             negative_weights = 1.0)
 
         maybe_log2 = torch.log(torch.tensor([2.0])) if self.surrogate_type == 'xent' else torch.tensor([1.0])
         maybe_log2 = maybe_log2.type(logits.dtype)
         lambda_term = lambdas * label_priors * (target_recall - 1.0) * maybe_log2
-        loss = torch.reshape(weighted_loss + lambda_term, original_shape)
+        loss = torch.reshape(weighted_loss, original_shape) + lambda_term
         other_outputs = {
             'lambdas': self.lambdas_obj,
             'label_priors': label_priors,
@@ -1483,12 +1483,22 @@ class DualVariable():
     """
     def __init__(self, shape, dtype, initializer, trainable, dual_rate_factor):
         self.trainable = trainable
+        self.initializer = initializer
         self.dual_rate_factor = dual_rate_factor
-        self.dual_variable = initializer(torch.empty(shape, dtype = dtype)).requires_grad_(trainable)
+        self.dual_variable = (initializer(torch.empty(shape, dtype = dtype)) * 1).requires_grad_(trainable)
+        self.optimizer = torch.optim.SGD([{'params': self.dual_variable, 'lr': -dual_rate_factor}])
 
     def nonnegativity_constraint(self):
         # Using the absolute value enforces nonnegativity.
         self.dual_variable = torch.abs(self.dual_variable.detach()).requires_grad_(True)
+
+    def update(self, loss):
+        lambda_optimizer = torch.optim.SGD([{'params': self.dual_variable, 'lr': -self.dual_rate_factor}])
+        lambda_optimizer.zero_grad()
+        loss.backward(retain_graph = True)
+        lambda_optimizer.step()
+
+        self.nonnegativity_constraint()
 
 '''def _create_dual_variable(shape, dtype, initializer, trainable, dual_rate_factor):
     """Creates a new dual variable.
